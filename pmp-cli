@@ -1,0 +1,792 @@
+#!/usr/bin/env python3
+"""
+pmp-cli — PSP PMP converter / compressor
+
+Commands:
+  pmp-cli convert  <input.mp4>  [output.pmp]  [options]
+  pmp-cli compress <input.pmp>  [output.pmp]  [options]
+  pmp-cli batch    <dir|file...>              [options]
+
+Requires: ffmpeg, ffprobe
+"""
+
+import argparse, struct, subprocess, os, sys, json, tempfile, shutil, glob
+
+# --- PMP constants -----------------------------------------------------------
+PMP_MAGIC   = 0x6d706d70
+PMP_VERSION = 1
+HDR_SIZE    = 56
+DEF_W, DEF_H = 480, 272
+FPS_MAX     = 25
+
+# --- helpers -----------------------------------------------------------------
+
+def die(msg):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+def log(msg, verbose=True):
+    if verbose:
+        print(msg)
+
+def is_keyframe(vdata: bytes) -> bool:
+    """True if vdata contains NAL type 5 (IDR slice) - Annex B."""
+    i = 0
+    while i < len(vdata) - 4:
+        if vdata[i:i+4] == b'\x00\x00\x00\x01':
+            if i + 4 < len(vdata) and (vdata[i+4] & 0x1F) == 5:
+                return True
+            i += 4
+        elif vdata[i:i+3] == b'\x00\x00\x01':
+            if i + 3 < len(vdata) and (vdata[i+3] & 0x1F) == 5:
+                return True
+            i += 3
+        else:
+            i += 1
+    return False
+
+# --- PMP parse / build -------------------------------------------------------
+
+def parse_pmp(data: bytes) -> dict:
+    if len(data) < HDR_SIZE:
+        die("file too small to be PMP")
+    (magic, version,
+     vid_format, n_vframes, width, height, vid_scale, vid_rate,
+     aud_format, n_astreams, aud_max_frames, aud_scale, aud_rate, aud_stereo
+    ) = struct.unpack_from('<14I', data, 0)
+
+    if magic != PMP_MAGIC:
+        die(f"not a PMP file (magic={hex(magic)})")
+    if version != PMP_VERSION:
+        die(f"unsupported PMP version: {version}")
+
+    idx_off  = HDR_SIZE
+    data_off = idx_off + n_vframes * 4
+    index    = [struct.unpack_from('<I', data, idx_off + i*4)[0]
+                for i in range(n_vframes)]
+
+    packets = []
+    pos = data_off
+    for i in range(n_vframes):
+        pkt_size = index[i] >> 1
+        keyframe = index[i] & 1
+        pkt = data[pos:pos+pkt_size]
+        pos += pkt_size
+
+        n_af = pkt[0]
+        hn   = n_af * n_astreams + 3
+        m    = struct.unpack_from(f'<{hn}I', pkt, 1)
+        fd, ld, vlen = m[0], m[1], m[2]
+        alens = list(m[3:])
+
+        mhdr_sz = 1 + hn * 4
+        vdata   = pkt[mhdr_sz:mhdr_sz+vlen]
+        adata   = []
+        apos    = mhdr_sz + vlen
+        for al in alens:
+            adata.append(pkt[apos:apos+al])
+            apos += al
+
+        packets.append({
+            'kf': keyframe, 'n_af': n_af,
+            'fd': fd, 'ld': ld,
+            'vdata': vdata, 'adata': adata
+        })
+
+    return {
+        'magic': magic, 'version': version,
+        'vid_format': vid_format, 'n_vframes': n_vframes,
+        'width': width, 'height': height,
+        'vid_scale': vid_scale, 'vid_rate': vid_rate,
+        'aud_format': aud_format, 'n_astreams': n_astreams,
+        'aud_max_frames': aud_max_frames,
+        'aud_scale': aud_scale, 'aud_rate': aud_rate, 'aud_stereo': aud_stereo,
+        'fps': vid_rate / vid_scale,
+        'packets': packets,
+    }
+
+
+def build_pmp(meta: dict, new_packets: list) -> bytes:
+    n         = len(new_packets)
+    n_astreams = meta['n_astreams']
+    max_af    = max((p['n_af'] for p in new_packets), default=0)
+
+    hdr = struct.pack('<14I',
+        meta['magic'], meta['version'],
+        meta['vid_format'], n,
+        meta['width'], meta['height'],
+        meta['vid_scale'], meta['vid_rate'],
+        meta['aud_format'], n_astreams, max_af,
+        meta['aud_scale'], meta['aud_rate'], meta['aud_stereo'],
+    )
+
+    raw_packets = []
+    new_index   = []
+    for p in new_packets:
+        vdata, adata = p['vdata'], p['adata']
+        n_af = p['n_af']
+        hn   = n_af * n_astreams + 3
+        mini = struct.pack(f'<B{hn}I',
+            n_af, p['fd'], p['ld'], len(vdata),
+            *[len(a) for a in adata]
+        )
+        raw = mini + vdata + b''.join(adata)
+        raw_packets.append(raw)
+        new_index.append((len(raw) << 1) | p['kf'])
+
+    idx_data = b''.join(struct.pack('<I', x) for x in new_index)
+    pkt_data = b''.join(raw_packets)
+    return hdr + idx_data + pkt_data
+
+# --- video encoding ----------------------------------------------------------
+
+def x264_params(args, br: int = None) -> str:
+    p = f"level={args.level}:bframes={args.bframes}"
+    if args.profile == 'baseline':
+        p += ":cabac=0:8x8dct=0:weightp=0"
+    elif args.profile == 'high':
+        p += ":cabac=1:8x8dct=1:weightp=2"
+    else:  # main
+        p += ":cabac=1:8x8dct=0:weightp=0"
+    if br:
+        p += f":vbv-bufsize={br}:vbv-maxrate={br}"
+    else:
+        p += f":vbv-bufsize={args.vbv_bufsize}:vbv-maxrate={args.vbv_maxrate}"
+    p += ":rc-lookahead=40:force-cfr=1"
+    if args.extra_x264:
+        p += ":" + args.extra_x264.strip(':')
+    return p
+
+
+def encode_video(src: str, width: int, height: int, fps,
+                 args, tmp: str, verbose: bool,
+                 video_mode: str = 'vbr',
+                 video_bitrate: int = None) -> list:
+    """Encode src -> H.264 Annex B, return list[bytes] (one per frame).
+    video_mode='vbr' -> CRF (quality-based)
+    video_mode='cbr' -> constant bitrate, requires video_bitrate (kbps)
+    """
+    ll   = 'warning' if verbose else 'error'
+    mp4  = os.path.join(tmp, 'v.mp4')
+    h264 = os.path.join(tmp, 'v.h264')
+
+    vf = (f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+          f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2")
+    if getattr(args, 'deinterlace', False):
+        vf = f"yadif," + vf
+
+    if video_mode == 'cbr':
+        if not video_bitrate:
+            die("--video-bitrate is required for --video-mode cbr")
+        br = video_bitrate
+        rate_args = [
+            '-b:v', f'{br}k',
+            '-minrate', f'{br}k',
+            '-maxrate', f'{br}k',
+            '-bufsize', f'{br*2}k',
+        ]
+    else:
+        br = None
+        rate_args = ['-crf', str(args.crf)]
+
+    cmd = [
+        'ffmpeg', '-y', '-hide_banner', '-loglevel', ll,
+        '-i', src,
+        '-map', '0:v:0',
+        '-c:v', 'libx264', '-preset', args.preset,
+        '-g', str(args.keyint),
+        '-vf', vf,
+        *rate_args,
+        '-x264-params', x264_params(args, br), '-an',
+    ]
+    if fps:
+        cmd += ['-r', str(fps)]
+    cmd.append(mp4)
+    subprocess.run(cmd, check=True)
+
+    subprocess.run([
+        'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+        '-i', mp4, '-c:v', 'copy',
+        '-bsf:v', 'h264_mp4toannexb', '-f', 'h264', h264
+    ], check=True)
+
+    res = subprocess.run([
+        'ffprobe', '-v', 'quiet',
+        '-select_streams', 'v:0',
+        '-show_packets', '-print_format', 'json', h264
+    ], capture_output=True, text=True, check=True)
+
+    pkts = json.loads(res.stdout)['packets']
+    with open(h264, 'rb') as f:
+        raw = f.read()
+
+    frames = []
+    for p in pkts:
+        pos  = int(p['pos'])
+        size = int(p['size'])
+        frames.append(raw[pos:pos+size])
+    return frames
+
+# --- audio extraction / re-encode --------------------------------------------
+
+def _aac_rate_args(audio_mode: str, audio_bitrate: int, audio_quality: float) -> list:
+    if audio_mode == 'vbr':
+        return ['-q:a', str(audio_quality)]
+    else:
+        return ['-b:a', f'{audio_bitrate}k']
+
+
+def _audio_channels(args) -> tuple:
+    """Return (ac, aud_stereo) from --audio-channels."""
+    if args.audio_channels == 'mono':
+        return 1, 0
+    return 2, 1
+
+
+def extract_audio(src: str, tmp: str, aud_rate: int, ac: int,
+                  audio_mode: str, audio_bitrate: int,
+                  audio_quality: float, verbose: bool) -> list:
+    """Extract/re-encode audio from any source -> ADTS AAC.
+    Returns list of dicts {data, pts_us}."""
+    ll  = 'warning' if verbose else 'error'
+    aac = os.path.join(tmp, 'a.aac')
+
+    subprocess.run([
+        'ffmpeg', '-y', '-hide_banner', '-loglevel', ll,
+        '-i', src, '-vn',
+        '-c:a', 'aac', '-ar', str(aud_rate), '-ac', str(ac),
+        *_aac_rate_args(audio_mode, audio_bitrate, audio_quality),
+        aac
+    ], check=True)
+
+    return _aac_frames(aac)
+
+
+def recompress_audio_from_pmp(pmp_path: str, tmp: str, aud_rate: int, ac: int,
+                              audio_mode: str, audio_bitrate: int,
+                              audio_quality: float, verbose: bool) -> list:
+    """Re-encode audio from PMP file -> ADTS AAC.
+    Uses ffmpeg's built-in PMP demuxer to extract audio correctly.
+    Returns list of {data, pts_us}."""
+    ll = 'warning' if verbose else 'error'
+    reenc = os.path.join(tmp, 'reenc_a.aac')
+
+    try:
+        subprocess.run([
+            'ffmpeg', '-y', '-hide_banner', '-loglevel', ll,
+            '-i', pmp_path,
+            '-map', '0:a:0', '-vn',
+            '-c:a', 'aac', '-ar', str(aud_rate), '-ac', str(ac),
+            *_aac_rate_args(audio_mode, audio_bitrate, audio_quality),
+            reenc
+        ], check=True, capture_output=True)
+
+        return _aac_frames(reenc)
+    except subprocess.CalledProcessError as e:
+        log(f"  warning: audio re-encode failed: {e}", verbose)
+        log(f"  keeping original audio unchanged", verbose)
+        return []
+
+
+def _aac_frames(aac_path: str) -> list:
+    """Parse ADTS AAC file -> list of {data, pts_us}."""
+    res = subprocess.run([
+        'ffprobe', '-v', 'quiet',
+        '-select_streams', 'a:0',
+        '-show_packets', '-print_format', 'json', aac_path
+    ], capture_output=True, text=True, check=True)
+
+    pkts = json.loads(res.stdout).get('packets', [])
+    with open(aac_path, 'rb') as f:
+        raw = f.read()
+
+    frames = []
+    for p in pkts:
+        if p.get('pos', '-1') in ('-1', 'N/A'):
+            continue
+        pos   = int(p['pos'])
+        size  = int(p['size'])
+        pts_s = float(p.get('pts_time') or p.get('dts_time') or '0')
+        frames.append({'data': raw[pos:pos+size], 'pts_us': int(pts_s * 1e6)})
+    return frames
+
+
+def align_audio(n_vframes: int, fps: float, aframes: list) -> list:
+    """Group audio frames into buckets per video frame."""
+    dur = 1_000_000.0 / fps
+    buckets = [[] for _ in range(n_vframes)]
+    for af in aframes:
+        idx = int(af['pts_us'] / dur)
+        idx = min(idx, n_vframes - 1)
+        buckets[idx].append(af['data'])
+    return buckets
+
+
+def delays_for(frame_idx: int, fps: float, bucket: list, aud_rate: int) -> tuple:
+    """Compute (first_delay, last_delay) in microseconds."""
+    aac_dur = int(1024 * 1_000_000 / aud_rate)
+    if bucket:
+        base = int(frame_idx * aac_dur)
+        return base, base + (len(bucket) - 1) * aac_dur
+    frame_dur = int(1_000_000 / fps)
+    base = frame_idx * frame_dur
+    return base, base + frame_dur
+
+# --- subcommands -------------------------------------------------------------
+
+def _stream_flags(args) -> tuple:
+    """Return (do_video, do_audio) based on --stream flag."""
+    s = getattr(args, 'stream', 'both')
+    return (s in ('video', 'both')), (s in ('audio', 'both'))
+
+
+def do_compress(src: str, dst: str, args, verbose: bool):
+    """PMP -> PMP: re-encode video and/or audio."""
+    log(f"compress: {src} -> {dst}", verbose)
+    with open(src, 'rb') as f:
+        data = f.read()
+
+    meta = parse_pmp(data)
+    fps  = meta['fps']
+    do_vid, do_aud = _stream_flags(args)
+
+    mode_v = getattr(args, 'video_mode', 'vbr')
+    mode_a = getattr(args, 'audio_mode', 'cbr')
+    vbr_v  = getattr(args, 'video_bitrate', None)
+    aq     = getattr(args, 'audio_quality', 2.0)
+    ac, aud_stereo = _audio_channels(args)
+
+    stream = 'video' if do_vid and not do_aud else 'audio' if do_aud and not do_vid else 'both'
+    log(f"  {meta['width']}x{meta['height']} @ {fps:.2f}fps  "
+        f"{meta['n_vframes']} frames  [stream={stream}]", verbose)
+
+    orig = meta['packets']
+    n    = meta['n_vframes']
+    tmp  = tempfile.mkdtemp(prefix='pmpcli_')
+    try:
+        if do_vid:
+            new_vframes = encode_video(
+                src, meta['width'], meta['height'], None,
+                args, tmp, verbose,
+                video_mode=mode_v, video_bitrate=vbr_v
+            )
+            if len(new_vframes) != n:
+                log(f"  warning: frames {len(new_vframes)} != {n}, adjusting", verbose)
+                if len(new_vframes) < n:
+                    while len(new_vframes) < n:
+                        new_vframes.append(new_vframes[-1])
+                else:
+                    new_vframes = new_vframes[:n]
+        else:
+            new_vframes = [p['vdata'] for p in orig]
+
+        if do_aud and meta['n_astreams'] > 0 and not args.no_audio:
+            log(f"  re-encode audio [{mode_a}]...", verbose)
+            new_aframes = recompress_audio_from_pmp(
+                src, tmp, meta['aud_rate'], ac,
+                mode_a, args.audio_bitrate, aq, verbose
+            )
+            audio_buckets = align_audio(n, fps, new_aframes) if new_aframes else None
+        else:
+            audio_buckets = None
+
+        new_pkts = []
+        for i in range(n):
+            vd = new_vframes[i]
+            op = orig[i]
+            kf = 1 if is_keyframe(vd) else 0
+
+            if audio_buckets is not None:
+                bucket = audio_buckets[i]
+                n_af   = len(bucket)
+                fd, ld = delays_for(i, fps, bucket, meta['aud_rate'])
+            else:
+                bucket = op['adata']
+                n_af   = op['n_af']
+                fd, ld = op['fd'], op['ld']
+
+            new_pkts.append({
+                'kf': kf, 'n_af': n_af,
+                'fd': fd, 'ld': ld,
+                'vdata': vd, 'adata': bucket
+            })
+
+        out = build_pmp(meta, new_pkts)
+        os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
+        with open(dst, 'wb') as f:
+            f.write(out)
+
+        src_mb = len(data) / 1048576
+        dst_mb = len(out)  / 1048576
+        log(f"  {src_mb:.2f} MB -> {dst_mb:.2f} MB  "
+            f"({100*(1-dst_mb/src_mb):.1f}% smaller)", verbose)
+    finally:
+        if not args.keep_temp:
+            shutil.rmtree(tmp, ignore_errors=True)
+        else:
+            log(f"  temp: {tmp}", verbose)
+
+
+def do_convert(src: str, dst: str, args, verbose: bool):
+    """MP4 (or any video) -> PMP."""
+    log(f"convert: {src} -> {dst}", verbose)
+
+    mode_v = getattr(args, 'video_mode', 'vbr')
+    mode_a = getattr(args, 'audio_mode', 'cbr')
+    vbr_v  = getattr(args, 'video_bitrate', None)
+    aq     = getattr(args, 'audio_quality', 2.0)
+    ac, aud_stereo = _audio_channels(args)
+
+    res = subprocess.run([
+        'ffprobe', '-v', 'quiet',
+        '-print_format', 'json', '-show_streams', src
+    ], capture_output=True, text=True, check=True)
+    streams = json.loads(res.stdout)['streams']
+
+    has_audio = any(s['codec_type'] == 'audio' for s in streams)
+    vstream   = next((s for s in streams if s['codec_type'] == 'video'), None)
+    if not vstream:
+        die(f"no video stream in {src}")
+
+    # FPS: PMP spec allows 1..~38, but >25fps is not recommended.
+    # --fps is capped at FPS_MAX; default is 24 (or source if slower).
+    if args.fps:
+        if args.fps <= 0:
+            die("--fps must be > 0")
+        fps = min(args.fps, FPS_MAX)
+    else:
+        fr = vstream.get('r_frame_rate', '30/1')
+        try:
+            a, b = fr.split('/')
+            src_fps = float(a) / float(b)
+        except (ValueError, ZeroDivisionError):
+            src_fps = 0
+        fps = min(24, src_fps) if src_fps else 24
+
+    width  = args.width
+    height = args.height
+
+    vid_scale = 1000
+    vid_rate  = round(fps * 1000)
+
+    aud_rate   = args.audio_rate
+    aud_format = 1
+    n_astreams = 1 if has_audio and not args.no_audio else 0
+    aud_scale  = 1024   # AAC frame size in samples
+    if n_astreams == 0:
+        aud_stereo = 0
+
+    tmp = tempfile.mkdtemp(prefix='pmpcli_')
+    try:
+        new_vframes = encode_video(
+            src, width, height, fps,
+            args, tmp, verbose,
+            video_mode=mode_v, video_bitrate=vbr_v
+        )
+        n_vframes = len(new_vframes)
+        log(f"  video: {n_vframes} frames @ {fps:.3f}fps  "
+            f"{width}x{height}  [{mode_v}]", verbose)
+
+        audio_buckets = [[] for _ in range(n_vframes)]
+        if n_astreams > 0:
+            aframes = extract_audio(src, tmp, aud_rate, ac,
+                                    mode_a, args.audio_bitrate, aq, verbose)
+            audio_buckets = align_audio(n_vframes, fps, aframes)
+            log(f"  audio: {len(aframes)} AAC frames distributed  [{mode_a}]", verbose)
+
+        new_pkts = []
+        for i in range(n_vframes):
+            vd     = new_vframes[i]
+            bucket = audio_buckets[i]
+            kf     = 1 if is_keyframe(vd) else 0
+            n_af   = len(bucket)
+            fd, ld = delays_for(i, fps, bucket, aud_rate)
+            new_pkts.append({
+                'kf': kf, 'n_af': n_af,
+                'fd': fd, 'ld': ld,
+                'vdata': vd, 'adata': bucket
+            })
+
+        max_af = max((p['n_af'] for p in new_pkts), default=0)
+        meta = {
+            'magic': PMP_MAGIC, 'version': PMP_VERSION,
+            'vid_format': 1,
+            'n_vframes': n_vframes,
+            'width': width, 'height': height,
+            'vid_scale': vid_scale, 'vid_rate': vid_rate,
+            'aud_format': aud_format, 'n_astreams': n_astreams,
+            'aud_max_frames': max_af,
+            'aud_scale': aud_scale, 'aud_rate': aud_rate,
+            'aud_stereo': aud_stereo,
+            'fps': fps,
+        }
+
+        out = build_pmp(meta, new_pkts)
+        os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
+        with open(dst, 'wb') as f:
+            f.write(out)
+        log(f"  {len(out)/1048576:.2f} MB -> {dst}", verbose)
+    finally:
+        if not args.keep_temp:
+            shutil.rmtree(tmp, ignore_errors=True)
+        else:
+            log(f"  temp: {tmp}", verbose)
+
+# --- batch -------------------------------------------------------------------
+
+def collect_files(paths: list, recursive: bool, mode: str) -> list:
+    """Collect input files from paths (files or dirs)."""
+    exts = {
+        'compress': {'.pmp'},
+        'convert':  {'.mp4', '.mkv', '.avi', '.mov', '.flv', '.webm'},
+        'both':     {'.pmp', '.mp4', '.mkv', '.avi', '.mov', '.flv', '.webm'},
+    }[mode]
+
+    result = []
+    for p in paths:
+        if os.path.isfile(p):
+            if os.path.splitext(p)[1].lower() in exts:
+                result.append(os.path.abspath(p))
+        elif os.path.isdir(p):
+            pattern = '**/*' if recursive else '*'
+            for ext in exts:
+                for fp in glob.glob(os.path.join(p, pattern + ext),
+                                    recursive=recursive):
+                    result.append(os.path.abspath(fp))
+        else:
+            print(f"skip: not found: {p}", file=sys.stderr)
+    return sorted(set(result))
+
+
+def batch_output(src: str, batch_mode: str, args) -> str:
+    """Determine output path for a batch item."""
+    base, ext = os.path.splitext(src)
+    if batch_mode == 'compress':
+        out_name = base + args.suffix + '.pmp'
+    else:
+        out_name = base + '.pmp'
+
+    if args.output_dir:
+        out_name = os.path.join(args.output_dir,
+                                os.path.basename(out_name))
+    return out_name
+
+
+def cmd_convert(args):
+    src = os.path.expanduser(args.input)
+    dst = os.path.expanduser(args.output) if args.output else None
+    dst = dst or (os.path.splitext(src)[0] + '.pmp')
+    do_convert(src, dst, args, verbose=not args.quiet)
+
+
+def cmd_compress(args):
+    src = os.path.expanduser(args.input)
+    dst = os.path.expanduser(args.output) if args.output else None
+    dst = dst or (os.path.splitext(src)[0] + args.suffix + '.pmp')
+    do_compress(src, dst, args, verbose=not args.quiet)
+
+
+def cmd_batch(args):
+    batch_mode = args.batch_mode   # compress | convert
+    args.paths = [os.path.expanduser(p) for p in args.paths]
+    files = collect_files(args.paths, args.recursive, batch_mode)
+
+    if not files:
+        die("no matching files")
+
+    print(f"batch: {len(files)} files ({batch_mode})")
+    if args.dry_run:
+        for f in files:
+            print(f"  {f} -> {batch_output(f, batch_mode, args)}")
+        return
+
+    ok = fail = 0
+    for i, src in enumerate(files, 1):
+        dst = batch_output(src, batch_mode, args)
+        print(f"[{i}/{len(files)}] {os.path.basename(src)}")
+
+        if args.replace:
+            tmp_dst = dst + '.pmctmp'
+            real_dst = src if batch_mode == 'compress' else dst
+            try:
+                if batch_mode == 'compress':
+                    do_compress(src, tmp_dst, args, verbose=not args.quiet)
+                else:
+                    do_convert(src, tmp_dst, args, verbose=not args.quiet)
+                shutil.move(tmp_dst, real_dst)
+                ok += 1
+            except Exception as e:
+                print(f"  error: {e}", file=sys.stderr)
+                if os.path.exists(tmp_dst):
+                    os.remove(tmp_dst)
+                fail += 1
+        else:
+            try:
+                if batch_mode == 'compress':
+                    do_compress(src, dst, args, verbose=not args.quiet)
+                else:
+                    do_convert(src, dst, args, verbose=not args.quiet)
+                ok += 1
+            except Exception as e:
+                print(f"  error: {e}", file=sys.stderr)
+                fail += 1
+
+    print(f"done: {ok} ok, {fail} failed")
+
+# --- argument parser ---------------------------------------------------------
+
+def add_encode_args(p):
+    g_vid = p.add_argument_group('video')
+    g_vid.add_argument('--video-mode', dest='video_mode',
+                       choices=['vbr', 'cbr'], default='vbr',
+                       help='video bitrate mode: vbr=CRF, cbr=constant (default: vbr)')
+    g_vid.add_argument('--crf',        type=int, default=28,
+                       help='CRF quality [vbr] 0-51, lower=better (default: 28)')
+    g_vid.add_argument('--video-bitrate', type=int, default=None,
+                       dest='video_bitrate',
+                       help='video bitrate in kbps [cbr], e.g. 1500')
+    g_vid.add_argument('--preset',     default='slow',
+                       choices=['ultrafast','superfast','veryfast','faster',
+                                'fast','medium','slow','slower','veryslow'],
+                       help='x264 preset (default: slow)')
+    g_vid.add_argument('--profile',    default='main',
+                       choices=['baseline', 'main', 'high'],
+                       help='H.264 profile (default: main)')
+    g_vid.add_argument('--level',      default='3.0',
+                       help='H.264 level, e.g. 3.0/3.1/3.2/4.0 (default: 3.0)')
+    g_vid.add_argument('--bframes',    type=int, default=0, choices=[0, 1, 2],
+                       help='max B-frames (default: 0)')
+    g_vid.add_argument('--deinterlace', action='store_true',
+                       help='deinterlace source with yadif')
+    g_vid.add_argument('--width',      type=int, default=DEF_W,
+                       help=f'width (default: {DEF_W})')
+    g_vid.add_argument('--height',     type=int, default=DEF_H,
+                       help=f'height (default: {DEF_H})')
+    g_vid.add_argument('--fps',        type=float, default=None,
+                       help=f'output fps (max {FPS_MAX}, >25 not recommended; default: 24 or source)')
+    g_vid.add_argument('--vbv-maxrate', type=int, default=4000,
+                       dest='vbv_maxrate',
+                       help='VBV maxrate kbps [vbr] (default: 4000)')
+    g_vid.add_argument('--vbv-bufsize', type=int, default=4000,
+                       dest='vbv_bufsize',
+                       help='VBV bufsize kbps [vbr] (default: 4000)')
+    g_vid.add_argument('--keyint',     type=int, default=250,
+                       help='keyframe interval (default: 250)')
+    g_vid.add_argument('--extra-x264', default='', dest='extra_x264',
+                       help='extra x264 params, e.g. "me=hex:subme=7"')
+
+    g_aud = p.add_argument_group('audio')
+    g_aud.add_argument('--audio-mode', dest='audio_mode',
+                       choices=['vbr', 'cbr'], default='cbr',
+                       help='audio bitrate mode: vbr=quality, cbr=constant (default: cbr)')
+    g_aud.add_argument('--audio-bitrate', type=int, default=96,
+                       dest='audio_bitrate',
+                       help='audio bitrate kbps [cbr] (default: 96)')
+    g_aud.add_argument('--audio-quality', type=float, default=2.0,
+                       dest='audio_quality',
+                       help='AAC VBR quality [vbr]: 0.1(best)...5.0(worst) (default: 2.0)')
+    g_aud.add_argument('--audio-rate', type=int, default=44100,
+                       dest='audio_rate', choices=[32000, 44100, 48000],
+                       help='audio sample rate (default: 44100)')
+    g_aud.add_argument('--audio-channels', default='stereo',
+                       dest='audio_channels', choices=['mono', 'stereo'],
+                       help='audio channels (default: stereo)')
+    g_aud.add_argument('--no-audio',   action='store_true', dest='no_audio',
+                       help='strip audio from output')
+
+    p.add_argument('--stream',
+                   choices=['video', 'audio', 'both'], default='both',
+                   help='what to compress: video/audio/both (default: both)')
+
+    p.add_argument('--suffix',     default='_compressed',
+                   help='output filename suffix (default: _compressed)')
+    p.add_argument('--keep-temp',  action='store_true', dest='keep_temp',
+                   help='keep temporary folder')
+    p.add_argument('-q', '--quiet', action='store_true',
+                   help='quiet mode')
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog='pmp-cli',
+        description='PSP PMP converter / compressor',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # VBR video (CRF) + CBR audio (defaults)
+  pmp-cli convert video.mp4 out.pmp --crf 26 --audio-bitrate 96
+
+  # CBR video + VBR audio
+  pmp-cli convert video.mp4 out.pmp --video-mode cbr --video-bitrate 1500 \\
+              --audio-mode vbr --audio-quality 1.5
+
+  # force fps (max 25)
+  pmp-cli convert video.mp4 out.pmp --fps 25
+
+  # compress video only (keep audio)
+  pmp-cli compress movie.pmp --stream video --crf 30 --preset fast
+
+  # compress audio only (keep video)
+  pmp-cli compress movie.pmp --stream audio --audio-mode vbr --audio-quality 3.0
+
+  # batch: replace all .pmp recursively, video only
+  pmp-cli batch ./pmps/ --batch-mode compress --recursive --replace --stream video
+
+  # batch: convert all MP4 in folder
+  pmp-cli batch ./videos/ --batch-mode convert --output-dir ./out/
+"""
+    )
+
+    sub = parser.add_subparsers(dest='cmd')
+
+    p_conv = sub.add_parser('convert', help='MP4/MKV/... -> PMP')
+    p_conv.add_argument('input',  help='input video file')
+    p_conv.add_argument('output', nargs='?', help='output .pmp (default: next to input)')
+    add_encode_args(p_conv)
+
+    p_comp = sub.add_parser('compress', help='PMP -> PMP (re-encode, smaller)')
+    p_comp.add_argument('input',  help='input .pmp')
+    p_comp.add_argument('output', nargs='?', help='output .pmp (default: <name>_compressed.pmp)')
+    add_encode_args(p_comp)
+
+    p_bat = sub.add_parser('batch', help='batch process files / directories')
+    p_bat.add_argument('paths', nargs='+',
+                       help='files and/or directories to process')
+    p_bat.add_argument('--batch-mode', dest='batch_mode',
+                       choices=['compress', 'convert'], default='compress',
+                       help='compress (PMP->PMP) or convert (MP4->PMP) (default: compress)')
+    p_bat.add_argument('-r', '--recursive', action='store_true',
+                       help='recurse into subdirectories')
+    p_bat.add_argument('--replace', action='store_true',
+                       help='replace originals (atomic via temp)')
+    p_bat.add_argument('--output-dir', dest='output_dir', default=None,
+                       help='output folder (default: next to source)')
+    p_bat.add_argument('--dry-run', action='store_true', dest='dry_run',
+                       help='show what would be done, do nothing')
+    add_encode_args(p_bat)
+
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args   = parser.parse_args()
+
+    if not args.cmd:
+        parser.print_help()
+        sys.exit(0)
+
+    for dep in ('ffmpeg', 'ffprobe'):
+        if shutil.which(dep) is None:
+            die(f"{dep} not found in PATH")
+
+    if args.cmd == 'convert':
+        cmd_convert(args)
+    elif args.cmd == 'compress':
+        cmd_compress(args)
+    elif args.cmd == 'batch':
+        cmd_batch(args)
+
+
+if __name__ == '__main__':
+    main()
