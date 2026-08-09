@@ -17,7 +17,7 @@ PMP_MAGIC   = 0x6d706d70
 PMP_VERSION = 1
 HDR_SIZE    = 56
 DEF_W, DEF_H = 480, 272
-FPS_MAX     = 25
+FPS_MAX     = 29.97
 
 # --- helpers -----------------------------------------------------------------
 
@@ -448,8 +448,8 @@ def do_convert(src: str, dst: str, args, verbose: bool):
     if not vstream:
         die(f"no video stream in {src}")
 
-    # FPS: PMP spec allows 1..~38, but >25fps is not recommended.
-    # --fps is capped at FPS_MAX; default is 24 (or source if slower).
+    # FPS: PMP spec allows 1..~38, but >29.97fps is not recommended.
+    # --fps is capped at FPS_MAX; default is source fps (or FPS_MAX if higher).
     if args.fps:
         if args.fps <= 0:
             die("--fps must be > 0")
@@ -461,7 +461,7 @@ def do_convert(src: str, dst: str, args, verbose: bool):
             src_fps = float(a) / float(b)
         except (ValueError, ZeroDivisionError):
             src_fps = 0
-        fps = min(24, src_fps) if src_fps else 24
+        fps = min(FPS_MAX, src_fps) if src_fps else FPS_MAX
 
     width  = args.width
     height = args.height
