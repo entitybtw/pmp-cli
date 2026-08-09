@@ -152,7 +152,7 @@ def x264_params(args, br: int = None) -> str:
         p += f":vbv-bufsize={br}:vbv-maxrate={br}"
     else:
         p += f":vbv-bufsize={args.vbv_bufsize}:vbv-maxrate={args.vbv_maxrate}"
-    p += ":rc-lookahead=40:force-cfr=1:aud=1:nal-hrd=none"
+    p += ":rc-lookahead=40:force-cfr=1:aud=1"
     if args.extra_x264:
         p += ":" + args.extra_x264.strip(':')
     return p
