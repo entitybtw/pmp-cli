@@ -316,6 +316,25 @@ def extract_audio(src: str, tmp: str, aud_rate: int, ac: int,
     return _aac_frames(aac)
 
 
+def extract_raw_audio_from_pmp(pmp_data: bytes, meta: dict) -> list:
+    """Extract raw audio frames directly from PMP without re-encoding.
+    Returns list of {data, pts_us} - preserves original audio data."""
+    packets = parse_pmp(pmp_data)['packets']
+    
+    frames = []
+    frame_idx = 0
+    aac_dur_us = int(1024 * 1_000_000 / meta['aud_rate'])
+    
+    for pkt in packets:
+        for adata in pkt['adata']:
+            if len(adata) > 0:
+                pts_us = frame_idx * aac_dur_us
+                frames.append({'data': adata, 'pts_us': pts_us})
+                frame_idx += 1
+    
+    return frames
+
+
 def recompress_audio_from_pmp(pmp_path: str, tmp: str, aud_rate: int, ac: int,
                               audio_mode: str, audio_bitrate: int,
                               audio_quality: float, verbose: bool) -> list:
@@ -343,7 +362,9 @@ def recompress_audio_from_pmp(pmp_path: str, tmp: str, aud_rate: int, ac: int,
 
 
 def _aac_frames(aac_path: str) -> list:
-    """Parse ADTS AAC file -> list of {data, pts_us}."""
+    """Parse ADTS AAC file -> list of {data, pts_us}.
+    Strips ADTS headers (7 bytes) to produce raw AAC frames for PSP.
+    """
     res = subprocess.run([
         'ffprobe', '-v', 'quiet',
         '-select_streams', 'a:0',
@@ -361,7 +382,13 @@ def _aac_frames(aac_path: str) -> list:
         pos   = int(p['pos'])
         size  = int(p['size'])
         pts_s = float(p.get('pts_time') or p.get('dts_time') or '0')
-        frames.append({'data': raw[pos:pos+size], 'pts_us': int(pts_s * 1e6)})
+        # Strip ADTS header (7 bytes) - PSP expects raw AAC
+        adts_hdr_size = 7
+        if size > adts_hdr_size:
+            frame_data = raw[pos+adts_hdr_size:pos+size]
+        else:
+            frame_data = raw[pos:pos+size]  # fallback if frame is too small
+        frames.append({'data': frame_data, 'pts_us': int(pts_s * 1e6)})
     return frames
 
 
@@ -434,15 +461,9 @@ def do_compress(src: str, dst: str, args, verbose: bool):
         else:
             new_vframes = [p['vdata'] for p in orig]
 
-        if do_aud and meta['n_astreams'] > 0 and not args.no_audio:
-            log(f"  re-encode audio [{mode_a}]...", verbose)
-            new_aframes = recompress_audio_from_pmp(
-                src, tmp, meta['aud_rate'], ac,
-                mode_a, args.audio_bitrate, aq, verbose
-            )
-            audio_buckets = align_audio(n, fps, new_aframes) if new_aframes else None
-        else:
-            audio_buckets = None
+        # For compress, always keep original audio (don't re-encode)
+        # Re-encoding through ffmpeg adds unwanted metadata
+        audio_buckets = None
 
         new_pkts = []
         for i in range(n):
