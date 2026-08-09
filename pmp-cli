@@ -152,7 +152,7 @@ def x264_params(args, br: int = None) -> str:
         p += f":vbv-bufsize={br}:vbv-maxrate={br}"
     else:
         p += f":vbv-bufsize={args.vbv_bufsize}:vbv-maxrate={args.vbv_maxrate}"
-    p += ":rc-lookahead=40:force-cfr=1"
+    p += ":rc-lookahead=40:force-cfr=1:aud=1:nal-hrd=none"
     if args.extra_x264:
         p += ":" + args.extra_x264.strip(':')
     return p
@@ -207,7 +207,7 @@ def encode_video(src: str, width: int, height: int, fps,
     subprocess.run([
         'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
         '-i', mp4, '-c:v', 'copy',
-        '-bsf:v', 'h264_mp4toannexb', '-f', 'h264', h264
+        '-bsf:v', 'h264_mp4toannexb,filter_units=remove_types=6', '-f', 'h264', h264
     ], check=True)
 
     res = subprocess.run([

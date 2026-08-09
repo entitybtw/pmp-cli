@@ -83,6 +83,7 @@ Packet Data       → Video + Audio packets
 - Resolution: up to 720×512 (divisible by 8), 480×272 recommended
 - FPS: 1-25 (>25 causes performance issues on PSP)
 - **Critical:** `aud_scale` must be 1024 (PSP crashes if set to 1)
+- **Critical:** NAL structure must be `AUD → SPS → PPS → IDR` (PSP hardware decoder requirement)
 
 ## Building Binary
 
