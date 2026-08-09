@@ -126,11 +126,20 @@ def build_pmp(meta: dict, new_packets: list) -> bytes:
         vdata, adata = p['vdata'], p['adata']
         n_af = p['n_af']
         hn   = n_af * n_astreams + 3
+        
+        # adata can be list[bytes] or list[dict] with 'data' key
+        audio_data = []
+        for a in adata:
+            if isinstance(a, dict):
+                audio_data.append(a['data'])
+            else:
+                audio_data.append(a)
+        
         mini = struct.pack(f'<B{hn}I',
             n_af, p['fd'], p['ld'], len(vdata),
-            *[len(a) for a in adata]
+            *[len(a) for a in audio_data]
         )
-        raw = mini + vdata + b''.join(adata)
+        raw = mini + vdata + b''.join(audio_data)
         raw_packets.append(raw)
         new_index.append((len(raw) << 1) | p['kf'])
 
@@ -393,25 +402,36 @@ def _aac_frames(aac_path: str) -> list:
 
 
 def align_audio(n_vframes: int, fps: float, aframes: list) -> list:
-    """Group audio frames into buckets per video frame."""
+    """Group audio frames into buckets per video frame.
+    Returns list of buckets, each containing {'data': bytes, 'pts_us': int}."""
     dur = 1_000_000.0 / fps
     buckets = [[] for _ in range(n_vframes)]
     for af in aframes:
         idx = int(af['pts_us'] / dur)
         idx = min(idx, n_vframes - 1)
-        buckets[idx].append(af['data'])
+        buckets[idx].append({'data': af['data'], 'pts_us': af['pts_us']})
     return buckets
 
 
 def delays_for(frame_idx: int, fps: float, bucket: list, aud_rate: int) -> tuple:
-    """Compute (first_delay, last_delay) in microseconds."""
+    """Compute (first_delay, last_delay) in microseconds.
+    fd = when first audio frame starts relative to this video frame
+    ld = when last audio frame ends relative to next video frame"""
+    if not bucket:
+        frame_dur = int(1_000_000 / fps)
+        return 0, frame_dur
+    
     aac_dur = int(1024 * 1_000_000 / aud_rate)
-    if bucket:
-        base = int(frame_idx * aac_dur)
-        return base, base + (len(bucket) - 1) * aac_dur
-    frame_dur = int(1_000_000 / fps)
-    base = frame_idx * frame_dur
-    return base, base + frame_dur
+    video_start = int(frame_idx * 1_000_000 / fps)
+    next_video_start = int((frame_idx + 1) * 1_000_000 / fps)
+    
+    first_audio_start = bucket[0]['pts_us']
+    last_audio_end = bucket[-1]['pts_us'] + aac_dur
+    
+    fd = first_audio_start - video_start
+    ld = last_audio_end - next_video_start
+    
+    return fd, ld
 
 # --- subcommands -------------------------------------------------------------
 
