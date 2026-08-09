@@ -485,9 +485,9 @@ def do_compress(src: str, dst: str, args, verbose: bool):
         else:
             new_vframes = [p['vdata'] for p in orig]
 
-        # For compress: re-encode audio only if explicitly requested via --stream audio
-        if do_aud and not do_vid:
-            # User wants to compress audio only
+        # Re-encode audio whenever requested (--stream audio or both),
+        # unless --no-audio. Fallback to original if re-encode fails.
+        if do_aud and not args.no_audio:
             audio_frames = recompress_audio_from_pmp(
                 src, tmp, meta['aud_rate'], ac, mode_a,
                 getattr(args, 'audio_bitrate', 96), aq, verbose
@@ -498,7 +498,7 @@ def do_compress(src: str, dst: str, args, verbose: bool):
                 # Fallback if re-encode fails
                 audio_buckets = None
         else:
-            # Keep original audio (don't re-encode when compressing video or both)
+            # Keep original audio
             audio_buckets = None
 
         new_pkts = []
