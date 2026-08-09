@@ -1,4 +1,4 @@
-name: Build Windows Binary
+name: Build Binaries
 
 on:
   push:
@@ -43,5 +43,44 @@ jobs:
       uses: softprops/action-gh-release@v1
       with:
         files: dist/pmp-cli.exe
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-linux:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    
+    - name: Install FFmpeg
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ffmpeg
+    
+    - name: Install PyInstaller
+      run: |
+        pip install pyinstaller
+    
+    - name: Build Binary
+      run: |
+        pyinstaller --onefile --name pmp-cli-bin pmp-cli
+    
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: pmp-cli-linux
+        path: dist/pmp-cli-bin
+        retention-days: 90
+    
+    - name: Upload to Release
+      if: github.event_name == 'release'
+      uses: softprops/action-gh-release@v1
+      with:
+        files: dist/pmp-cli-bin
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
