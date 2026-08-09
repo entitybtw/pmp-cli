@@ -431,6 +431,10 @@ def delays_for(frame_idx: int, fps: float, bucket: list, aud_rate: int) -> tuple
     fd = first_audio_start - video_start
     ld = last_audio_end - next_video_start
     
+    # Clamp to uint32 range to avoid struct.pack overflow
+    fd = max(0, min(fd, 4294967295))
+    ld = max(0, min(ld, 4294967295))
+    
     return fd, ld
 
 # --- subcommands -------------------------------------------------------------
