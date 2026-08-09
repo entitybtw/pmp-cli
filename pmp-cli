@@ -141,18 +141,16 @@ def build_pmp(meta: dict, new_packets: list) -> bytes:
 # --- video encoding ----------------------------------------------------------
 
 def x264_params(args, br: int = None) -> str:
-    p = f"level={args.level}:bframes={args.bframes}"
-    if args.profile == 'baseline':
-        p += ":cabac=0:8x8dct=0:weightp=0"
-    elif args.profile == 'high':
-        p += ":cabac=1:8x8dct=1:weightp=2"
-    else:  # main
-        p += ":cabac=1:8x8dct=0:weightp=0"
+    # PMP AVC settings from xvid4psp (PSP compatibility)
+    p = f"level={args.level}:ref=2:bframes=0:b-adapt=0:direct=none"
+    p += ":me=umh:subme=7:trellis=1:partitions=p8x8,b8x8,i4x4,p4x4"
+    p += ":cabac=1:8x8dct=0:weightp=0:weightb=0"
+    p += ":no-fast-pskip=1:no-dct-decimate=1"
     if br:
         p += f":vbv-bufsize={br}:vbv-maxrate={br}"
     else:
         p += f":vbv-bufsize={args.vbv_bufsize}:vbv-maxrate={args.vbv_maxrate}"
-    p += ":rc-lookahead=40:force-cfr=1:aud=1:pic-struct=0"
+    p += ":rc-lookahead=40:force-cfr=1:aud=1:pic-struct=1:nal-hrd=vbr"
     if args.extra_x264:
         p += ":" + args.extra_x264.strip(':')
     return p
@@ -696,8 +694,8 @@ def add_encode_args(p):
     g_vid.add_argument('--video-mode', dest='video_mode',
                        choices=['vbr', 'cbr'], default='vbr',
                        help='video bitrate mode: vbr=CRF, cbr=constant (default: vbr)')
-    g_vid.add_argument('--crf',        type=int, default=28,
-                       help='CRF quality [vbr] 0-51, lower=better (default: 28)')
+    g_vid.add_argument('--crf',        type=int, default=21,
+                       help='CRF quality [vbr] 0-51, lower=better (default: 21)')
     g_vid.add_argument('--video-bitrate', type=int, default=None,
                        dest='video_bitrate',
                        help='video bitrate in kbps [cbr], e.g. 1500')
@@ -708,7 +706,7 @@ def add_encode_args(p):
     g_vid.add_argument('--profile',    default='baseline',
                        choices=['baseline', 'main', 'high'],
                        help='H.264 profile (default: baseline for PSP compatibility)')
-    g_vid.add_argument('--level',      default='1.3',
+    g_vid.add_argument('--level',      default='3.0',
                        help='H.264 level, e.g. 1.3/2.1/3.0 (default: 1.3 for PSP)')
     g_vid.add_argument('--bframes',    type=int, default=0, choices=[0, 1, 2],
                        help='max B-frames (default: 0)')
