@@ -489,7 +489,7 @@ def do_compress(src: str, dst: str, args, verbose: bool):
                 getattr(args, 'audio_bitrate', 96), aq, verbose
             )
             if audio_frames:
-                audio_buckets = align_audio(audio_frames, n, fps)
+                audio_buckets = align_audio(n, fps, audio_frames)
             else:
                 # Fallback if re-encode fails
                 audio_buckets = None
