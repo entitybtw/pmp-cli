@@ -1,0 +1,63 @@
+diff --git a/common/base.c b/common/base.c
+index 3427727..9559e59 100644
+--- a/common/base.c
++++ b/common/base.c
+@@ -989,6 +989,8 @@ REALIGN_STACK int x264_param_parse( x264_param_t *p, const char *name, const cha
+     }
+     OPT("bluray-compat")
+         p->b_bluray_compat = atobool(value);
++    OPT("psp-compat")
++        p->b_psp_compat = atobool(value);
+     OPT("avcintra-class")
+         p->i_avcintra_class = atoi(value);
+     OPT("avcintra-flavor")
+diff --git a/encoder/set.c b/encoder/set.c
+index ec47193..91cc3fa 100644
+--- a/encoder/set.c
++++ b/encoder/set.c
+@@ -169,8 +169,13 @@ void x264_sps_init( x264_sps_t *sps, int i_id, x264_param_t *param )
+     sps->i_log2_max_frame_num = 4;
+     while( (1 << sps->i_log2_max_frame_num) <= max_frame_num )
+         sps->i_log2_max_frame_num++;
++    /* PMP-PSP compatibility: match XviD4PSP 5 reference SPS (log2_max_frame_num_minus4=5, pic_order_cnt_type=0) */
++    if( param->b_psp_compat )
++        sps->i_log2_max_frame_num = 9;
+ 
+     sps->i_poc_type = param->i_bframe || param->b_interlaced || param->i_avcintra_class ? 0 : 2;
++    if( param->b_psp_compat && sps->i_poc_type == 2 )
++        sps->i_poc_type = 0;
+     if( sps->i_poc_type == 0 )
+     {
+         int max_delta_poc = (param->i_bframe + 2) * (!!param->i_bframe_pyramid + 1) * 2;
+diff --git a/x264.c b/x264.c
+index 8158315..c4f8db9 100644
+--- a/x264.c
++++ b/x264.c
+@@ -925,6 +925,7 @@ static void help( x264_param_t *defaults, int longhelp )
+     H0( "      --frames <integer>      Maximum number of frames to encode\n" );
+     H0( "      --level <string>        Specify level (as defined by Annex A)\n" );
+     H1( "      --bluray-compat         Enable compatibility hacks for Blu-ray support\n" );
++    H1( "      --psp-compat            PMP/PSP: force log2_max_frame_num_minus4=5, pic_order_cnt_type=0\n" );
+     H1( "      --avcintra-class <integer> Use compatibility hacks for AVC-Intra class\n"
+         "                                  - %s\n", stringify_names( buf, x264_avcintra_class_names ) );
+     H1( "      --avcintra-flavor <string> AVC-Intra flavor [\"%s\"]\n"
+@@ -1031,6 +1032,7 @@ static struct option long_options[] =
+     { "b-pyramid",            required_argument, NULL, 0 },
+     { "open-gop",             no_argument,       NULL, 0 },
+     { "bluray-compat",        no_argument,       NULL, 0 },
++    { "psp-compat",           no_argument,       NULL, 0 },
+     { "avcintra-class",       required_argument, NULL, 0 },
+     { "avcintra-flavor",      required_argument, NULL, 0 },
+     { "min-keyint",           required_argument, NULL, 'i' },
+diff --git a/x264.h b/x264.h
+index b3223cd..e6a8f50 100644
+--- a/x264.h
++++ b/x264.h
+@@ -371,6 +371,7 @@ typedef struct x264_param_t
+     int         i_bframe_pyramid;   /* Keep some B-frames as references: 0=off, 1=strict hierarchical, 2=normal */
+     int         b_open_gop;
+     int         b_bluray_compat;
++    int         b_psp_compat;   /* PMP/PSP: force log2_max_frame_num_minus4=5, pic_order_cnt_type=0 */
+     int         i_avcintra_class;
+     int         i_avcintra_flavor;
+ 

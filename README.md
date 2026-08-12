@@ -33,15 +33,22 @@ pmp-cli batch ./videos/ --batch-mode convert --output-dir ./pmp-files/
 # Maximum quality
 pmp-cli convert movie.mp4 movie.pmp --crf 18 --preset veryslow
 
-# Fast conversion
-pmp-cli convert test.mp4 test.pmp --preset ultrafast
-
-# Maximum compatibility
-pmp-cli convert video.mp4 output.pmp --profile baseline --fps 24
+# PSP reference-compatible encode (uses bundled bin/x264)
+pmp-cli convert video.mp4 output.pmp --x264-exe bin/x264
 
 # Batch compress, replace originals
 pmp-cli batch ./library/ --batch-mode compress --recursive --replace --crf 30
 ```
+
+### PSP-compatible video (XviD4PSP 5 exact preset)
+
+`pmp-cli` bundles a native x264 built with `--psp-compat`, which emits the exact
+PSP reference SPS (`log2_max_frame_num_minus4=5`, `pic_order_cnt_type=0`) —
+the same stream params XviD4PSP 5 produced (fixes stutter/tearing on real PSP).
+
+- When `bin/x264` exists next to `pmp-cli` it is used automatically.
+- `--x264-exe <path>` overrides the binary. A non-`.exe` build runs directly
+  (native); a `.exe` (e.g. the old XviD4PSP 2009 build) runs via `wine`.
 
 ## Key Options
 

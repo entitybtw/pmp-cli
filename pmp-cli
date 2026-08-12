@@ -150,16 +150,17 @@ def build_pmp(meta: dict, new_packets: list) -> bytes:
 # --- video encoding ----------------------------------------------------------
 
 def x264_params(args, br: int = None) -> str:
-    # PMP AVC settings from xvid4psp (PSP compatibility)
+    # PMP AVC settings, exact match of XviD4PSP 5 "x264 HQ Extreme" preset.
+    # xvid4psp CLI: --crf 21 --level 3.0 --ref 2 --deblock -2:-1
+    #   --direct none --no-b-adapt --no-8x8dct --no-weightb --weightp 0
+    #   --pictiming --bframes 0 --trellis 2 --no-fast-pskip --no-dct-decimate
+    #   --aud --partitions p8x8,b8x8,i4x4,p4x4 --me umh --subme 9
     p = f"level={args.level}:ref=2:bframes=0:b-adapt=0:direct=none"
-    p += ":me=umh:subme=7:trellis=1:partitions=p8x8,b8x8,i4x4,p4x4"
+    p += ":deblock=-2,-1"
+    p += ":me=umh:subme=9:trellis=2:partitions=p8x8,b8x8,i4x4,p4x4"
     p += ":cabac=1:8x8dct=0:weightp=0:weightb=0"
     p += ":no-fast-pskip=1:no-dct-decimate=1"
-    if br:
-        p += f":vbv-bufsize={br}:vbv-maxrate={br}"
-    else:
-        p += f":vbv-bufsize={args.vbv_bufsize}:vbv-maxrate={args.vbv_maxrate}"
-    p += ":rc-lookahead=40:force-cfr=1:aud=1:pic-struct=1:nal-hrd=vbr"
+    p += ":aud=1:pic-struct=1:force-cfr=1"
     if args.extra_x264:
         p += ":" + args.extra_x264.strip(':')
     return p
@@ -217,6 +218,169 @@ def reorder_nals_for_psp(h264_data: bytes) -> bytes:
     return h264_data
 
 
+class _BitWriter:
+    def __init__(self):
+        self.bits = []
+    def write(self, v, n):
+        for k in range(n - 1, -1, -1):
+            self.bits.append((v >> k) & 1)
+    def ue(self, v):
+        code_num = v + 1
+        l = code_num.bit_length()
+        self.write(0, l - 1)
+        self.write(code_num, l)
+    def to_bytes(self):
+        out = bytearray()
+        for chunk in range(0, len(self.bits), 8):
+            b = 0
+            for bit in self.bits[chunk:chunk+8]:
+                b = (b << 1) | bit
+            b <<= (8 - len(self.bits[chunk:chunk+8]))
+            out.append(b)
+        return bytes(out)
+
+
+class _BitReader:
+    def __init__(self, data):
+        self.bits = []
+        for byte in data:
+            self.bits.extend([(byte >> (7 - k)) & 1 for k in range(8)])
+        self.i = 0
+    def get(self, n):
+        v = 0
+        for _ in range(n):
+            v = (v << 1) | self.bits[self.i]
+            self.i += 1
+        return v
+    def ue(self):
+        z = 0
+        while self.bits[self.i] == 0:
+            z += 1
+            self.i += 1
+        self.i += 1
+        if z == 0:
+            return 0
+        return (1 << z) - 1 + self.get(z)
+
+
+def parse_sps(sps: bytes):
+    """Return dict of parsed SPS fields."""
+    r = _BitReader(sps)
+    out = {}
+    out['profile_idc'] = r.get(8)
+    out['constraint'] = r.get(8)
+    out['level_idc'] = r.get(8)
+    out['seq_parameter_set_id'] = r.ue()
+    out['log2_max_frame_num_minus4'] = r.ue()
+    out['pic_order_cnt_type'] = r.get(2)
+    if out['pic_order_cnt_type'] == 0:
+        out['log2_max_pic_order_cnt_lsb_minus4'] = r.ue()
+    elif out['pic_order_cnt_type'] == 1:
+        out['delta_pic_order_always_zero_flag'] = r.get(1)
+        out['offset_for_non_ref_pic'] = r.ue()
+        out['offset_for_top_to_bottom_field'] = r.ue()
+        num = r.ue()
+        out['num_ref_frames_in_pic_order_cnt_cycle'] = num
+        out['offset_for_ref_frame'] = [r.ue() for _ in range(num)]
+    out['max_num_ref_frames'] = r.ue()
+    out['gaps_in_frame_num_value_allowed_flag'] = r.get(1)
+    out['pic_width_in_mbs_minus1'] = r.ue()
+    out['pic_height_in_map_units_minus1'] = r.ue()
+    out['frame_mbs_only_flag'] = r.get(1)
+    if not out['frame_mbs_only_flag']:
+        out['mb_adaptive_frame_field_flag'] = r.get(1)
+    out['direct_8x8_inference_flag'] = r.get(1)
+    return out
+
+
+def patch_sps_for_psp(h264_data: bytes) -> bytes:
+    """Patch the first SPS NAL for PSP Media Engine compatibility.
+    Rewrites log2_max_frame_num_minus4=4 and pic_order_cnt_type=1,
+    matching xvid4psp reference SPS. Keeps dimensions and remaining fields.
+    """
+    i = 0
+    while i < len(h264_data) - 3:
+        if h264_data[i:i+3] == b'\x00\x00\x01' and (h264_data[i+3] & 0x1f) == 7:
+            start = i
+            end = i + 4
+            while end < len(h264_data) - 3:
+                if h264_data[end:end+3] in (b'\x00\x00\x01', b'\x00\x00\x00'):
+                    break
+                end += 1
+            nal = h264_data[start:end]
+            sps = nal[4:]
+            try:
+                f = parse_sps(sps)
+                # Rewrite only up to and including direct_8x8_inference_flag,
+                # then append ALL remaining bits verbatim.
+                # To do that we locate the bit offset of the first remaining
+                # field (which parse_sps consumed beyond it) by re-running a
+                # targeted tokenizer that stops after direct_8x8_inference.
+                r = _BitReader(sps)
+                r.get(8); r.get(8); r.get(8)
+                r.ue()          # seq_parameter_set_id
+                r.ue()          # log2_max_frame_num_minus4 (patched value)
+                poc_type = r.get(2)
+                if poc_type == 0:
+                    r.ue()
+                elif poc_type == 1:
+                    r.get(1)
+                    r.ue(); r.ue()
+                    for _ in range(r.ue()):
+                        r.ue()
+                r.ue()          # max_num_ref_frames
+                r.get(1)        # gaps flag
+                r.ue()          # width
+                r.ue()          # height
+                frame_only = r.get(1)
+                if not frame_only:
+                    r.get(1)
+                r.get(1)        # direct_8x8_inference
+                # r.i is now the bit offset where the untouched remainder starts
+                remainder_bits = r.bits[r.i:]
+
+                w = _BitWriter()
+                w.write(f['profile_idc'], 8)
+                w.write(f['constraint'], 8)
+                w.write(f['level_idc'], 8)
+                w.ue(f['seq_parameter_set_id'])
+                w.ue(4)              # log2_max_frame_num_minus4 = 4
+                w.write(1, 2)        # pic_order_cnt_type = 1
+                w.write(0, 1)        # delta_pic_order_always_zero_flag
+                w.ue(0)              # offset_for_non_ref_pic
+                w.ue(0)              # offset_for_top_to_bottom_field
+                w.ue(0)              # num_ref_frames_in_pic_order_cnt_cycle
+                w.ue(f['max_num_ref_frames'])
+                w.write(f['gaps_in_frame_num_value_allowed_flag'], 1)
+                w.ue(f['pic_width_in_mbs_minus1'])
+                w.ue(f['pic_height_in_map_units_minus1'])
+                w.write(f['frame_mbs_only_flag'], 1)
+                if not f['frame_mbs_only_flag']:
+                    w.write(f['mb_adaptive_frame_field_flag'], 1)
+                w.write(f['direct_8x8_inference_flag'], 1)
+                w.bits.extend(remainder_bits)
+
+                new_sps = w.to_bytes()
+                esc = bytearray()
+                zeros = 0
+                for bte in new_sps:
+                    if zeros >= 2 and bte <= 3:
+                        esc.append(3)
+                        zeros = 0
+                    if bte == 0:
+                        zeros += 1
+                    else:
+                        zeros = 0
+                    esc.append(bte)
+
+                new_nal = nal[:4] + bytes(esc)
+                return h264_data[:start] + new_nal + h264_data[end:]
+            except Exception:
+                return h264_data
+        i += 1
+    return h264_data
+
+
 def encode_video(src: str, width: int, height: int, fps,
                  args, tmp: str, verbose: bool,
                  video_mode: str = 'vbr',
@@ -224,6 +388,14 @@ def encode_video(src: str, width: int, height: int, fps,
     """Encode src -> H.264 Annex B, return list[bytes] (one per frame).
     video_mode='vbr' -> CRF (quality-based)
     video_mode='cbr' -> constant bitrate, requires video_bitrate (kbps)
+
+    Encoding backend:
+      - built-in native x264 (bin/x264, built with --psp-compat) when present —
+        produces the PSP reference SPS (log2_max_frame_num_minus4=5,
+        pic_order_cnt_type=0) directly, no wine needed;
+      - --x264-exe overrides the binary: a native (non-.exe) build is run
+        directly with --psp-compat; a .exe is run via wine (legacy);
+      - otherwise falls back to ffmpeg libx264 with the same xvid4psp preset.
     """
     ll   = 'warning' if verbose else 'error'
     mp4  = os.path.join(tmp, 'v.mp4')
@@ -234,41 +406,91 @@ def encode_video(src: str, width: int, height: int, fps,
     if getattr(args, 'deinterlace', False):
         vf = f"yadif," + vf
 
-    if video_mode == 'cbr':
-        if not video_bitrate:
-            die("--video-bitrate is required for --video-mode cbr")
-        br = video_bitrate
-        rate_args = [
-            '-b:v', f'{br}k',
-            '-minrate', f'{br}k',
-            '-maxrate', f'{br}k',
-            '-bufsize', f'{br*2}k',
+    x264_exe = getattr(args, 'x264_exe', None)
+    if not x264_exe:
+        bundled = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bin', 'x264')
+        if os.path.isfile(bundled) and os.access(bundled, os.X_OK):
+            x264_exe = bundled
+
+    use_native = bool(x264_exe) and not str(x264_exe).lower().endswith('.exe')
+
+    if x264_exe:
+        # --- real x264, exact XviD4PSP 5 "x264 HQ Extreme" preset --------
+        # Native build runs directly with --psp-compat (reference SPS);
+        # a Windows .exe is run via wine (legacy).
+        y4m  = os.path.join(tmp, 'v.y4m')
+        cmd = [
+            'ffmpeg', '-y', '-hide_banner', '-loglevel', ll,
+            '-i', src, '-map', '0:v:0', '-vf', vf,
         ]
+        if fps:
+            cmd += ['-r', str(fps)]
+        cmd += ['-f', 'yuv4mpegpipe', y4m]
+        subprocess.run(cmd, check=True)
+
+        x264_cli = [
+            '--level', '3.0', '--ref', '2', '--deblock', '-2:-1',
+            '--direct', 'none', '--no-b-adapt',
+            '--no-8x8dct', '--no-weightb', '--weightp', '0',
+            '--bframes', '0', '--trellis', '2',
+            '--no-fast-pskip', '--no-dct-decimate', '--aud',
+            '--partitions', 'p8x8,b8x8,i4x4,p4x4',
+            '--me', 'umh', '--subme', '9',
+        ]
+        if use_native:
+            x264_cli += ['--psp-compat']
+        else:
+            # legacy .exe (2009 build) has --pictiming but no --psp-compat
+            x264_cli += ['--pictiming']
+
+        if video_mode == 'cbr':
+            if not video_bitrate:
+                die("--video-bitrate is required for --video-mode cbr")
+            x264_cli += ['--bitrate', str(video_bitrate)]
+        else:
+            x264_cli += ['--crf', str(args.crf)]
+
+        runner = [str(x264_exe)] if use_native else ['wine', str(x264_exe)]
+        subprocess.run(
+            [*runner, *x264_cli, '-o', h264, y4m],
+            check=True)
     else:
-        br = None
-        rate_args = ['-crf', str(args.crf)]
+        # --- ffmpeg libx264 with the same xvid4psp preset ---------------
+        if video_mode == 'cbr':
+            if not video_bitrate:
+                die("--video-bitrate is required for --video-mode cbr")
+            br = video_bitrate
+            rate_args = [
+                '-b:v', f'{br}k',
+                '-minrate', f'{br}k',
+                '-maxrate', f'{br}k',
+                '-bufsize', f'{br*2}k',
+            ]
+        else:
+            br = None
+            rate_args = ['-crf', str(args.crf)]
 
-    cmd = [
-        'ffmpeg', '-y', '-hide_banner', '-loglevel', ll,
-        '-i', src,
-        '-map', '0:v:0',
-        '-c:v', 'libx264', '-preset', args.preset,
-        '-g', str(args.keyint),
-        '-vf', vf,
-        *rate_args,
-        '-x264-params', x264_params(args, br), '-an',
-    ]
-    if fps:
-        cmd += ['-r', str(fps)]
-    cmd.append(mp4)
-    subprocess.run(cmd, check=True)
+        cmd = [
+            'ffmpeg', '-y', '-hide_banner', '-loglevel', ll,
+            '-i', src,
+            '-map', '0:v:0',
+            '-c:v', 'libx264', '-preset', args.preset,
+            '-g', str(args.keyint),
+            '-vf', vf,
+            *rate_args,
+            '-x264-params', x264_params(args, br), '-an',
+        ]
+        if fps:
+            cmd += ['-r', str(fps)]
+        cmd.append(mp4)
+        subprocess.run(cmd, check=True)
 
-    # Convert to Annex B and reorder NALs: move initial SEI after PPS
-    subprocess.run([
-        'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-        '-i', mp4, '-c:v', 'copy',
-        '-bsf:v', 'h264_mp4toannexb', '-f', 'h264', h264
-    ], check=True)
+        # Convert to Annex B and reorder NALs: move initial SEI after PPS
+        subprocess.run([
+            'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+            '-i', mp4, '-c:v', 'copy',
+            '-bsf:v', 'h264_mp4toannexb', '-f', 'h264', h264
+        ], check=True)
 
     res = subprocess.run([
         'ffprobe', '-v', 'quiet',
@@ -785,6 +1007,11 @@ def add_encode_args(p):
                        help='keyframe interval (default: 250)')
     g_vid.add_argument('--extra-x264', default='', dest='extra_x264',
                        help='extra x264 params, e.g. "me=hex:subme=7"')
+    g_vid.add_argument('--x264-exe', default=None, dest='x264_exe',
+                       help='path to a x264 binary for PSP reference SPS. '
+                            'Native (non-.exe) builds are run directly with '
+                            '--psp-compat; a .exe runs via wine (legacy). '
+                            'Default: bundled bin/x264 when present.')
 
     g_aud = p.add_argument_group('audio')
     g_aud.add_argument('--audio-mode', dest='audio_mode',
