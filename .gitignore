@@ -3,4 +3,5 @@ build/
 *.spec
 резюме/
 *.pmp
+pmp_test/
 __pycache__/

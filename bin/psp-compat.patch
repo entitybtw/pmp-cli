@@ -11,11 +11,44 @@ index 3427727..9559e59 100644
      OPT("avcintra-class")
          p->i_avcintra_class = atoi(value);
      OPT("avcintra-flavor")
+diff --git a/encoder/encoder.c b/encoder/encoder.c
+index 20e620a..a81162f 100644
+--- a/encoder/encoder.c
++++ b/encoder/encoder.c
+@@ -2115,11 +2115,14 @@ int x264_encoder_headers( x264_t *h, x264_nal_t **pp_nal, int *pi_nal )
+         return -1;
+ 
+     /* identify ourselves */
+-    nal_start( h, NAL_SEI, NAL_PRIORITY_DISPOSABLE );
+-    if( x264_sei_version_write( h, &h->out.bs ) )
+-        return -1;
+-    if( nal_end( h ) )
+-        return -1;
++    if( !h->param.b_psp_compat )
++    {
++        nal_start( h, NAL_SEI, NAL_PRIORITY_DISPOSABLE );
++        if( x264_sei_version_write( h, &h->out.bs ) )
++            return -1;
++        if( nal_end( h ) )
++            return -1;
++    }
+ 
+     frame_size = encoder_encapsulate_nals( h, 0 );
+     if( frame_size < 0 )
+@@ -3728,7 +3731,7 @@ int     x264_encoder_encode( x264_t *h,
+     if( h->fenc->b_keyframe )
+     {
+         /* Avid's decoder strictly wants two SEIs for AVC-Intra so we can't insert the x264 SEI */
+-        if( h->param.b_repeat_headers && h->fenc->i_frame == 0 && !h->param.i_avcintra_class )
++        if( h->param.b_repeat_headers && h->fenc->i_frame == 0 && !h->param.i_avcintra_class && !h->param.b_psp_compat )
+         {
+             /* identify ourself */
+             nal_start( h, NAL_SEI, NAL_PRIORITY_DISPOSABLE );
 diff --git a/encoder/set.c b/encoder/set.c
-index ec47193..91cc3fa 100644
+index ec47193..0ed8ccb 100644
 --- a/encoder/set.c
 +++ b/encoder/set.c
-@@ -169,8 +169,13 @@ void x264_sps_init( x264_sps_t *sps, int i_id, x264_param_t *param )
+@@ -169,14 +169,25 @@ void x264_sps_init( x264_sps_t *sps, int i_id, x264_param_t *param )
      sps->i_log2_max_frame_num = 4;
      while( (1 << sps->i_log2_max_frame_num) <= max_frame_num )
          sps->i_log2_max_frame_num++;
@@ -29,6 +62,18 @@ index ec47193..91cc3fa 100644
      if( sps->i_poc_type == 0 )
      {
          int max_delta_poc = (param->i_bframe + 2) * (!!param->i_bframe_pyramid + 1) * 2;
+         sps->i_log2_max_poc_lsb = 4;
+         while( (1 << sps->i_log2_max_poc_lsb) <= max_delta_poc * 2 )
+             sps->i_log2_max_poc_lsb++;
++        /* PMP-PSP compatibility: match XviD4PSP 5 reference SPS
++         * (log2_max_poc_lsb_minus4=6). x264's minimal window makes
++         * pic_order_cnt_lsb wrap every 8 frames; the PSP ME decoder
++         * hangs on MSB wraparound, so widen the field to 10 bits. */
++        if( param->b_psp_compat )
++            sps->i_log2_max_poc_lsb = 10;
+     }
+ 
+     sps->b_vui = 1;
 diff --git a/x264.c b/x264.c
 index 8158315..c4f8db9 100644
 --- a/x264.c

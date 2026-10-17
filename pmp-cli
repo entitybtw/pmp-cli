@@ -51,6 +51,129 @@ def is_keyframe(vdata: bytes) -> bool:
             i += 1
     return False
 
+
+# --- PMP container rules (from pmp_muxer_avc / pmp_mod_avc sources) ---------
+#
+# Reference muxer  : http://jonny.leffe.dnsalias.com/pmp_mod_avc/ (pmp_muxer_avc)
+# Reference player : pmp_mod_avc (video -> sceMpegAvcDecode, audio -> libav)
+#
+#  * video.format      == 1 (H.264), audio.format 0 = MP3, 1 = AAC
+#  * width/height      multiple of 16, <= 480 x 272
+#  * aud_scale         samples per audio frame (1152 = MP3, 1024 = AAC)
+#  * every access unit starts with a 4-byte AUD, IDRs carry SPS/PPS in band
+#  * index keyframe bit: AUD(primary_pic_type == 0) followed by an SPS
+#  * first_delay/last_delay are measured in microseconds and satisfy
+#        first_delay + audio_span + last_delay == video_frame_duration
+#    (see time_math.pm of the official muxer)
+
+MAX_AU_SIZE = 0x40000   # sanity cap for one video access unit.  The reference
+                        # player DMAs the AU to the fixed ME buffer at 0x4a000
+                        # (avc.c: MEAVCBUF) - an oversized AU would be written
+                        # past that region on real hardware.
+
+
+def nal_units(vdata: bytes) -> list:
+    """Split an Annex B access unit into (nal_type, start, end, startcode_len)."""
+    starts = []
+    i, n = 0, len(vdata)
+    while i + 3 < n:
+        if vdata[i] != 0:            # cheap guard, most bytes are not 0
+            i += 1
+            continue
+        if vdata[i:i+4] == b'\x00\x00\x00\x01':
+            starts.append((i, 4)); i += 4
+        elif vdata[i+1] == 0 and vdata[i+2] == 1:
+            starts.append((i, 3)); i += 3
+        else:
+            i += 1
+    out = []
+    for k, (s, sc) in enumerate(starts):
+        if s + sc >= n:
+            break
+        e = starts[k+1][0] if k + 1 < len(starts) else n
+        out.append((vdata[s+sc] & 0x1f, s, e, sc))
+    return out
+
+
+def keyframe_flag(vdata: bytes) -> bool:
+    """Index keyframe bit using the reference pmp_muxer_avc rule.
+
+    The official avc_parser only cuts frames on 00 00 00 01 09 (AUD) and marks
+    a frame as keyframe when the AUD says "I only" (primary_pic_type == 0) and
+    the next NAL is an SPS - i.e. the decoder can restart from this packet.
+    Falls back to a plain IDR (NAL type 5) search for AUD-less streams.
+    """
+    nals = nal_units(vdata)
+    if not nals:
+        return False
+    ntype, start, _, sc = nals[0]
+    if ntype == 9 and sc == 4:
+        payload = start + sc + 1
+        if payload >= len(vdata) or (vdata[payload] >> 5) != 0:
+            return False
+        return len(nals) > 1 and nals[1][0] == 7 and nals[1][3] == 4
+    return is_keyframe(vdata)
+
+
+def _time_of(frame_number: int, scale: int, rate: int) -> int:
+    """time_math.pm: frame_number * scale * 1e6 / rate, truncated."""
+    return (frame_number * scale * 1_000_000) // rate
+
+
+def interleave_audio(n_vframes: int, v_rate: int, v_scale: int,
+                     a_rate: int, a_scale: int) -> list:
+    """Official pmp_muxer_avc interleaving (time_math.pm), exact integer math.
+
+    Returns one dict per video frame:
+        {'n_af': n_audio_frames, 'fd': first_delay, 'ld': last_delay,
+         'a_start': index of the first audio frame of this video frame}
+
+    Guarantees (what the PSP player expects, exactly time_math.pm):
+        fd >= 0, ld > 0, n_af >= 1 as long as the fps is below the audio frame
+        rate, and per packet
+            first_delay + (t_a(last) - t_a(first)) + last_delay
+                == video frame duration
+        i.e. fd + (n_af - 1) audio steps + ld == v_dur up to floor rounding of
+        the timestamps (the official muxer uses exact rational math; the naive
+        fd + n_af*step + ld overshoots by one audio period, because last_delay
+        is measured from the START of the last audio frame and already covers
+        its playback time).
+    Audio frames past the end of the stream get an empty payload, exactly like
+    the reference muxer does (the player turns them into silence).
+    """
+    step = _time_of(1, a_scale, a_rate)
+    out = []
+    audio_number = 0            # next audio frame index
+    next_audio_time = 0         # end time of audio frame (audio_number - 1)
+    current_video_time = 0
+
+    for i in range(n_vframes):
+        a_start = audio_number
+        last_time = current_video_time
+        next_video_time = _time_of(i + 1, v_scale, v_rate)
+        first_delay = 0
+        count = 0
+
+        while next_audio_time < next_video_time:
+            if count == 0:
+                first_delay = next_audio_time - last_time
+            last_time = next_audio_time
+            audio_number += 1
+            next_audio_time = _time_of(audio_number, a_scale, a_rate)
+            count += 1
+            if step <= 0:       # degenerate rate, never loop forever
+                break
+
+        out.append({
+            'n_af': count,
+            'fd': max(0, first_delay),
+            'ld': max(0, next_video_time - last_time),
+            'a_start': a_start,
+        })
+        current_video_time = next_video_time
+
+    return out
+
 # --- PMP parse / build -------------------------------------------------------
 
 def parse_pmp(data: bytes) -> dict:
@@ -96,6 +219,7 @@ def parse_pmp(data: bytes) -> dict:
         packets.append({
             'kf': keyframe, 'n_af': n_af,
             'fd': fd, 'ld': ld,
+            'size': pkt_size, 'vlen': vlen,
             'vdata': vdata, 'adata': adata
         })
 
@@ -107,7 +231,7 @@ def parse_pmp(data: bytes) -> dict:
         'aud_format': aud_format, 'n_astreams': n_astreams,
         'aud_max_frames': aud_max_frames,
         'aud_scale': aud_scale, 'aud_rate': aud_rate, 'aud_stereo': aud_stereo,
-        'fps': vid_rate / vid_scale,
+        'fps': (vid_rate / vid_scale) if vid_scale else 0,
         'packets': packets,
     }
 
@@ -115,7 +239,8 @@ def parse_pmp(data: bytes) -> dict:
 def build_pmp(meta: dict, new_packets: list) -> bytes:
     n         = len(new_packets)
     n_astreams = meta['n_astreams']
-    max_af    = max((p['n_af'] for p in new_packets), default=0)
+    # the reference muxer never writes 0 here (players reject aud_max_frames 0)
+    max_af    = max((p['n_af'] for p in new_packets), default=0) or 1
 
     hdr = struct.pack('<14I',
         meta['magic'], meta['version'],
@@ -166,62 +291,71 @@ def x264_params(args, br: int = None) -> str:
     p += ":me=umh:subme=9:trellis=2:partitions=p8x8,b8x8,i4x4,p4x4"
     p += ":cabac=1:8x8dct=0:weightp=0:weightb=0"
     p += ":no-fast-pskip=1:no-dct-decimate=1"
-    p += ":aud=1:pic-struct=1:force-cfr=1"
+    # HRD + per-frame pic_timing SEI, same AU structure as the ME-tested
+    # reference PMPs (nal_hrd requires vbv in x264).
+    p += ":aud=1:force-cfr=1:nal_hrd=vbr"
+    p += f":vbv-maxrate={getattr(args, 'vbv_maxrate', 10000)}"
+    p += f":vbv-bufsize={getattr(args, 'vbv_bufsize', 10000)}"
     if args.extra_x264:
         p += ":" + args.extra_x264.strip(':')
     return p
 
 
-def reorder_nals_for_psp(h264_data: bytes) -> bytes:
-    """Reorder NAL units: move leading SEI after PPS for PSP compatibility.
-    Target: AUD → SPS → PPS → SEI → IDR (PSP format)
-    Input:  SEI → AUD → SPS → PPS → IDR (x264 default)
+def normalize_startcodes(data: bytes) -> bytes:
+    """Rewrite every Annex B start code to the 4 byte form 00 00 00 01.
+
+    The reference muxer scans for `00 00 00 01 09` when it cuts frames, and a
+    few encoders (ffmpeg's h264_mp4toannexb) emit 3 byte codes instead.
+    Payload bytes are never touched.
     """
-    nals = []
-    i = 0
-    while i < len(h264_data) - 3:
-        if h264_data[i:i+3] == b'\x00\x00\x01':
-            start = i
-            nal_type = h264_data[i+3] & 0x1f
-            
-            # Find end of NAL
-            end = i + 4
-            while end < len(h264_data) - 3:
-                if h264_data[end:end+3] in (b'\x00\x00\x00', b'\x00\x00\x01'):
-                    break
-                end += 1
-            
-            nals.append((nal_type, start, end))
-            
-            # Stop after IDR
-            if nal_type == 5:
-                break
-            i = end
+    nals = nal_units(data)
+    if not nals or all(sc == 4 for _, _, _, sc in nals):
+        return data
+    out = bytearray(data[:nals[0][1]])
+    for _, s, e, sc in nals:
+        out += b'\x00\x00\x00\x01'
+        out += data[s+sc:e]
+    return bytes(out)
+
+
+def reorder_nals_for_psp(h264_data: bytes) -> bytes:
+    """Put the non-slice NALs of every access unit into the order the PSP
+    decoder expects:  AUD -> SPS -> PPS -> SEI -> slice.
+
+    x264 writes its info SEI in front of the AUD, the ffmpeg/libx264 fallback
+    writes a pic-timing SEI right after the AUD (and one on every frame).
+    Only AUD/SEI/SPS/PPS are moved, slice data is never touched, so this stays
+    inside one access unit and keeps the byte count unchanged.
+    """
+    nals = nal_units(h264_data)
+    if not nals:
+        return h264_data
+
+    out = bytearray()
+    header = []
+
+    def flush():
+        if not header:
+            return
+        ordered = ([n for n in header if n[0] == 9] +          # AUD first
+                   [n for n in header if n[0] == 7] +          # then SPS
+                   [n for n in header if n[0] == 8] +          # then PPS
+                   [n for n in header if n[0] not in (7, 8, 9)])  # SEI etc.
+        for _, s, e, _ in ordered:
+            out.extend(h264_data[s:e])
+        del header[:]
+
+    for ntype, start, end, _ in nals:
+        if 1 <= ntype <= 5:          # slice -> close the header group
+            flush()
+            out.extend(h264_data[start:end])
         else:
-            i += 1
-    
-    # Check if reordering is needed: SEI(6) before AUD(9)
-    if len(nals) >= 4 and nals[0][0] == 6 and nals[1][0] == 9:
-        sei_start, sei_end = nals[0][1], nals[0][2]
-        
-        # Find PPS position
-        pps_end = None
-        for nal_type, start, end in nals:
-            if nal_type == 8:  # PPS
-                pps_end = end
-                break
-        
-        if pps_end:
-            # Extract SEI NAL
-            sei_nal = h264_data[sei_start:sei_end]
-            # Build: [before SEI] + [AUD...PPS] + [SEI] + [rest]
-            before_sei = h264_data[:sei_start]
-            after_sei_to_pps = h264_data[sei_end:pps_end]
-            after_pps = h264_data[pps_end:]
-            
-            return before_sei + after_sei_to_pps + sei_nal + after_pps
-    
-    return h264_data
+            header.append((ntype, start, end, 0))
+    flush()                          # trailing parameter sets (no slice)
+
+    reordered = bytes(out)
+    return reordered if len(reordered) == len(h264_data) else h264_data
+
 
 
 class _BitWriter:
@@ -278,7 +412,8 @@ def parse_sps(sps: bytes):
     out['level_idc'] = r.get(8)
     out['seq_parameter_set_id'] = r.ue()
     out['log2_max_frame_num_minus4'] = r.ue()
-    out['pic_order_cnt_type'] = r.get(2)
+    # pic_order_cnt_type is ue(v) (H.264 7.3.2.1), not a fixed 2-bit field
+    out['pic_order_cnt_type'] = r.ue()
     if out['pic_order_cnt_type'] == 0:
         out['log2_max_pic_order_cnt_lsb_minus4'] = r.ue()
     elif out['pic_order_cnt_type'] == 1:
@@ -326,7 +461,7 @@ def patch_sps_for_psp(h264_data: bytes) -> bytes:
                 r.get(8); r.get(8); r.get(8)
                 r.ue()          # seq_parameter_set_id
                 r.ue()          # log2_max_frame_num_minus4 (patched value)
-                poc_type = r.get(2)
+                poc_type = r.ue()
                 if poc_type == 0:
                     r.ue()
                 elif poc_type == 1:
@@ -387,13 +522,43 @@ def patch_sps_for_psp(h264_data: bytes) -> bytes:
     return h264_data
 
 
+def _y4m_set_rate(path: str, rate: int, scale: int):
+    """Force the frame rate of a y4m header.
+
+    Used when the source is a raw Annex B stream: ffmpeg cannot know the rate
+    from the PMP header and would declare 25 fps, which would leak into the
+    SPS VUI and desync A/V on the PSP.
+    """
+    import re
+    with open(path, 'rb') as f:
+        data = f.read()
+    nl = data.find(b'\n')
+    if nl < 0:
+        return
+    hdr = data[:nl]
+    new = re.sub(br'F[0-9]+:[0-9]+', b'F%d:%d' % (rate, scale), hdr)
+    if new == hdr:
+        if b' F' in hdr:
+            return
+        new = hdr + b' F%d:%d' % (rate, scale)
+    with open(path, 'wb') as f:
+        f.write(new + data[nl:])
+
+
 def encode_video(src: str, width: int, height: int, fps,
                  args, tmp: str, verbose: bool,
                  video_mode: str = 'vbr',
-                 video_bitrate: int = None) -> list:
+                 video_bitrate: int = None,
+                 annexb: bool = False,
+                 rate: int = None, scale: int = None) -> list:
     """Encode src -> H.264 Annex B, return list[bytes] (one per frame).
     video_mode='vbr' -> CRF (quality-based)
     video_mode='cbr' -> constant bitrate, requires video_bitrate (kbps)
+
+    annexb=True  -> src is already a raw Annex B elementary stream (PMP video
+    packets).  Frame timing is passed through untouched so the frame count is
+    preserved, and the y4m header is rewritten to rate/scale taken from the PMP
+    header instead of the 25 fps ffmpeg guesses.
 
     Encoding backend:
       - built-in native x264 (bin/x264, built with --psp-compat) when present —
@@ -412,6 +577,18 @@ def encode_video(src: str, width: int, height: int, fps,
     if getattr(args, 'deinterlace', False):
         vf = f"yadif," + vf
 
+    def run_ffmpeg(base: list, tail: list):
+        """ffmpeg run; in passthrough mode fall back to -vsync on old builds."""
+        if not annexb:
+            if fps:
+                base = base + ['-r', str(fps)]
+            subprocess.run(base + tail, check=True)
+            return
+        try:
+            subprocess.run(base + ['-fps_mode', 'passthrough'] + tail, check=True)
+        except subprocess.CalledProcessError:
+            subprocess.run(base + ['-vsync', '0'] + tail, check=True)
+
     x264_exe = getattr(args, 'x264_exe', None)
     if not x264_exe:
         bundled = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bin', 'x264')
@@ -425,26 +602,48 @@ def encode_video(src: str, width: int, height: int, fps,
         # Native build runs directly with --psp-compat (reference SPS);
         # a Windows .exe is run via wine (legacy).
         y4m  = os.path.join(tmp, 'v.y4m')
-        cmd = [
-            'ffmpeg', '-y', '-hide_banner', '-loglevel', ll,
-            '-i', src, '-map', '0:v:0', '-vf', vf,
-        ]
-        if fps:
-            cmd += ['-r', str(fps)]
-        cmd += ['-f', 'yuv4mpegpipe', y4m]
-        subprocess.run(cmd, check=True)
+        run_ffmpeg(
+            ['ffmpeg', '-y', '-hide_banner', '-loglevel', ll,
+             '-i', src, '-map', '0:v:0', '-vf', vf],
+            ['-f', 'yuv4mpegpipe', y4m])
+        if annexb:
+            _y4m_set_rate(y4m, rate or 25000, scale or 1000)
 
+        preset = str(getattr(args, 'preset', 'slow'))
         x264_cli = [
-            '--profile', 'baseline', '--level', '3.0', '--ref', '2', '--deblock', '-2:-1',
+            # XviD4PSP "x264 HQ Extreme" produced Main/CABAC + HRD VUI with
+            # per-frame pic-timing SEIs — every ME-tested reference PMP is
+            # profile_idc=77 cabac=1 nal_hrd=1.  Baseline/CAVLC encodes decode
+            # fine in ffmpeg/PPSSPP but hang the real ME ~5s in (first mid-GOP
+            # IDR, pkt#162): keep Main, never ship baseline to hardware.
+            '--preset', preset,
+            '--profile', str(getattr(args, 'profile', 'main')), '--level', '3.0', '--ref', '2', '--deblock', '-2:-1',
             '--direct', 'none', '--no-b-adapt',
             '--no-8x8dct', '--no-weightb', '--weightp', '0',
-            '--bframes', '0', '--trellis', '2',
-            '--no-fast-pskip', '--no-dct-decimate', '--aud',
-            '--partitions', 'p8x8,b8x8,i4x4,p4x4',
-            '--me', 'umh', '--subme', '9',
+            '--bframes', '0',
+            # ultrafast/superfast would drop CABAC (CAVLC hangs the real ME)
+            '--cabac',
+            '--aud',
+            '--keyint', str(getattr(args, 'keyint', 250)),
         ]
+        if preset == 'slow':
+            # the original XviD4PSP HQ-Extreme speed/quality knobs; faster
+            # presets use their own me/subme/trellis instead (2.5-5x encode)
+            x264_cli += ['--trellis', '2',
+                         '--no-fast-pskip', '--no-dct-decimate',
+                         '--partitions', 'p8x8,b8x8,i4x4,p4x4',
+                         '--me', 'umh', '--subme', '9']
         if use_native:
-            x264_cli += ['--psp-compat']
+            # HRD in the VUI makes x264 emit buffering_period + per-frame
+            # pic_timing SEIs, the exact AU structure the reference files
+            # carry.  XviD4PSP encoded every reference PMP with
+            # --nal-hrd vbr --vbv-maxrate 10000 --vbv-bufsize 10000
+            # (decoded HRD of all 11 mcsm PMPs: 10000128 bps / 10000128 bits).
+            # No --pic-struct: the reference SPS has pic_struct_present=0.
+            x264_cli += ['--psp-compat',
+                         '--nal-hrd', 'vbr',
+                         '--vbv-maxrate', str(getattr(args, 'vbv_maxrate', 10000)),
+                         '--vbv-bufsize', str(getattr(args, 'vbv_bufsize', 10000))]
         else:
             # legacy .exe (2009 build) has --pictiming but no --psp-compat
             x264_cli += ['--pictiming']
@@ -455,6 +654,15 @@ def encode_video(src: str, width: int, height: int, fps,
             x264_cli += ['--bitrate', str(video_bitrate)]
         else:
             x264_cli += ['--crf', str(args.crf)]
+
+        # --extra-x264 is appended last so it overrides the preset above,
+        # e.g. "subme=6:me=hex:trellis=1" is a 1.6x faster encode at the
+        # same bitrate (key=value pairs, ':' separated).
+        extra = str(getattr(args, 'extra_x264', '') or '').strip().strip(':')
+        for opt in (o.strip() for o in extra.split(':')):
+            if not opt:
+                continue
+            x264_cli.append(opt if opt.startswith('-') else '--' + opt)
 
         runner = [str(x264_exe)] if use_native else ['wine', str(x264_exe)]
         subprocess.run(
@@ -476,20 +684,16 @@ def encode_video(src: str, width: int, height: int, fps,
             br = None
             rate_args = ['-crf', str(args.crf)]
 
-        cmd = [
-            'ffmpeg', '-y', '-hide_banner', '-loglevel', ll,
-            '-i', src,
-            '-map', '0:v:0',
-            '-c:v', 'libx264', '-preset', args.preset,
-            '-g', str(args.keyint),
-            '-vf', vf,
-            *rate_args,
-            '-x264-params', x264_params(args, br), '-an',
-        ]
-        if fps:
-            cmd += ['-r', str(fps)]
-        cmd.append(mp4)
-        subprocess.run(cmd, check=True)
+        run_ffmpeg(
+            ['ffmpeg', '-y', '-hide_banner', '-loglevel', ll,
+             '-i', src,
+             '-map', '0:v:0',
+             '-c:v', 'libx264', '-preset', args.preset,
+             '-g', str(args.keyint),
+             '-vf', vf,
+             *rate_args,
+             '-x264-params', x264_params(args, br), '-an'],
+            [mp4])
 
         # Convert to Annex B and reorder NALs: move initial SEI after PPS
         subprocess.run([
@@ -498,6 +702,17 @@ def encode_video(src: str, width: int, height: int, fps,
             '-bsf:v', 'h264_mp4toannexb', '-f', 'h264', h264
         ], check=True)
 
+    # 4 byte start codes + PSP NAL order (AUD -> SPS -> PPS -> SEI -> slice)
+    # BEFORE probing, so the packet positions ffprobe reports describe the
+    # exact bytes we slice out.
+    with open(h264, 'rb') as f:
+        raw = f.read()
+    cleaned = reorder_nals_for_psp(normalize_startcodes(raw))
+    if cleaned != raw:
+        with open(h264, 'wb') as f:
+            f.write(cleaned)
+        raw = cleaned
+
     res = subprocess.run([
         'ffprobe', '-v', 'quiet',
         '-select_streams', 'v:0',
@@ -505,11 +720,6 @@ def encode_video(src: str, width: int, height: int, fps,
     ], capture_output=True, text=True, check=True)
 
     pkts = json.loads(res.stdout)['packets']
-    with open(h264, 'rb') as f:
-        raw = f.read()
-    
-    # Reorder NAL units for PSP compatibility
-    raw = reorder_nals_for_psp(raw)
 
     frames = []
     for p in pkts:
@@ -547,6 +757,7 @@ def extract_audio(src: str, tmp: str, aud_rate: int, ac: int,
         '-i', src, '-vn',
         '-c:a', 'aac', '-ar', str(aud_rate), '-ac', str(ac),
         *_aac_rate_args(audio_mode, audio_bitrate, audio_quality),
+        '-flags:a', '+bitexact',
         aac
     ], check=True)
 
@@ -588,6 +799,7 @@ def recompress_audio_from_pmp(pmp_path: str, tmp: str, aud_rate: int, ac: int,
             '-map', '0:a:0', '-vn',
             '-c:a', 'aac', '-ar', str(aud_rate), '-ac', str(ac),
             *_aac_rate_args(audio_mode, audio_bitrate, audio_quality),
+            '-flags:a', '+bitexact',
             reenc
         ], check=True, capture_output=True)
 
@@ -599,17 +811,24 @@ def recompress_audio_from_pmp(pmp_path: str, tmp: str, aud_rate: int, ac: int,
 
 
 def _aac_frames(aac_path: str) -> list:
-    """Parse ADTS AAC file -> list of {data, pts_us}.
-    Strips ADTS headers (7 bytes) to produce raw AAC frames for PSP.
+    """Parse ADTS AAC file -> list of {data, pts_us}."""
+    return _frames_from_file(aac_path, strip=7)
+
+
+def _frames_from_file(path: str, strip: int = 0) -> list:
+    """Split a raw ADTS/MP3 stream into codec frames using ffprobe packets.
+
+    strip=7 removes the ADTS header (PSP wants raw AAC frames),
+    strip=0 keeps MP3 frames as they are (they are already self contained).
     """
     res = subprocess.run([
         'ffprobe', '-v', 'quiet',
         '-select_streams', 'a:0',
-        '-show_packets', '-print_format', 'json', aac_path
+        '-show_packets', '-print_format', 'json', path
     ], capture_output=True, text=True, check=True)
 
     pkts = json.loads(res.stdout).get('packets', [])
-    with open(aac_path, 'rb') as f:
+    with open(path, 'rb') as f:
         raw = f.read()
 
     frames = []
@@ -619,51 +838,196 @@ def _aac_frames(aac_path: str) -> list:
         pos   = int(p['pos'])
         size  = int(p['size'])
         pts_s = float(p.get('pts_time') or p.get('dts_time') or '0')
-        # Strip ADTS header (7 bytes) - PSP expects raw AAC
-        adts_hdr_size = 7
-        if size > adts_hdr_size:
-            frame_data = raw[pos+adts_hdr_size:pos+size]
+        if size > strip:
+            data = raw[pos+strip:pos+size]
+        elif strip:
+            data = raw[pos:pos+size]  # fallback if frame is too small
         else:
-            frame_data = raw[pos:pos+size]  # fallback if frame is too small
-        frames.append({'data': frame_data, 'pts_us': int(pts_s * 1e6)})
+            data = raw[pos:pos+size]
+        frames.append({'data': data, 'pts_us': int(pts_s * 1e6)})
     return frames
 
 
-def align_audio(n_vframes: int, fps: float, aframes: list) -> list:
-    """Group audio frames into buckets per video frame.
-    Returns list of buckets, each containing {'data': bytes, 'pts_us': int}."""
-    dur = 1_000_000.0 / fps
-    buckets = [[] for _ in range(n_vframes)]
-    for af in aframes:
-        idx = int(af['pts_us'] / dur)
-        idx = min(idx, n_vframes - 1)
-        buckets[idx].append({'data': af['data'], 'pts_us': af['pts_us']})
-    return buckets
+# --- raw AAC / MP3 helpers --------------------------------------------------
+
+_AAC_RATES = [96000, 88200, 64000, 48000, 44100, 32000, 24000,
+              22050, 16000, 12000, 11025, 8000, 7350]
 
 
-def delays_for(frame_idx: int, fps: float, bucket: list, aud_rate: int) -> tuple:
-    """Compute (first_delay, last_delay) in microseconds.
-    fd = when first audio frame starts relative to this video frame
-    ld = when last audio frame ends relative to next video frame"""
-    if not bucket:
-        frame_dur = int(1_000_000 / fps)
-        return 0, frame_dur
-    
-    aac_dur = int(1024 * 1_000_000 / aud_rate)
-    video_start = int(frame_idx * 1_000_000 / fps)
-    next_video_start = int((frame_idx + 1) * 1_000_000 / fps)
-    
-    first_audio_start = bucket[0]['pts_us']
-    last_audio_end = bucket[-1]['pts_us'] + aac_dur
-    
-    fd = first_audio_start - video_start
-    ld = last_audio_end - next_video_start
-    
-    # Clamp to uint32 range to avoid struct.pack overflow
-    fd = max(0, min(fd, 4294967295))
-    ld = max(0, min(ld, 4294967295))
-    
-    return fd, ld
+def adts_header(frame_len: int, rate: int, channels: int, profile: int = 1) -> bytes:
+    """7 byte ADTS header (MPEG-4, no CRC) for a raw AAC-LC frame."""
+    try:
+        fi = _AAC_RATES.index(rate)
+    except ValueError:
+        fi = 4
+    hl = frame_len + 7
+    return bytes([
+        0xFF, 0xF1,
+        ((profile & 3) << 6) | (fi << 2) | ((channels >> 2) & 1),
+        ((channels & 3) << 6) | ((hl >> 11) & 3),
+        (hl >> 3) & 0xFF,
+        ((hl & 7) << 5) | 0x1F,
+        0xFC,
+    ])
+
+
+def reencode_audio_frames(aframes: list, meta: dict, args, tmp: str,
+                          verbose: bool, tag: str = '') -> list:
+    """Re-encode the raw audio frames taken straight out of a PMP.
+
+    aframes: list of raw codec frames (bytes).  The codec always follows the
+    container header so the file stays what it was: aud_format 1 (AAC) is
+    wrapped in ADTS for decoding, aud_format 0 (MP3) is already a raw stream.
+    Returns a list of raw frames (bytes) or [] when the re-encode failed, in
+    which case the caller keeps the original frames.
+    """
+    if not aframes:
+        return []
+
+    afmt     = meta['aud_format']
+    rate     = meta['aud_rate']
+    channels = 2 if meta['aud_stereo'] else 1
+    ll       = 'warning' if verbose else 'error'
+
+    if afmt == 1:
+        payload = b''.join(adts_header(len(a), rate, channels) + a for a in aframes)
+        src, dst = os.path.join(tmp, f'a{tag}_in.aac'), os.path.join(tmp, f'a{tag}_out.aac')
+        codec, strip = ['-c:a', 'aac'], 7
+        fmt = ['-f', 'adts']
+    elif afmt == 0:
+        payload = b''.join(aframes)
+        src, dst = os.path.join(tmp, f'a{tag}_in.mp3'), os.path.join(tmp, f'a{tag}_out.mp3')
+        codec, strip = ['-c:a', 'libmp3lame'], 0
+        fmt = ['-f', 'mp3']
+    else:
+        log(f"  warning: unknown aud_format {afmt}, keeping original audio", verbose)
+        return []
+
+    if not payload:
+        return []
+
+    with open(src, 'wb') as f:
+        f.write(payload)
+
+    mode = getattr(args, 'audio_mode', 'cbr')
+    rate_args = _aac_rate_args(mode, getattr(args, 'audio_bitrate', 96),
+                               getattr(args, 'audio_quality', 2.0))
+
+    cmd = ['ffmpeg', '-y', '-hide_banner', '-loglevel', ll,
+           '-i', src, *fmt] + codec + [
+           '-ar', str(rate), '-ac', str(channels), *rate_args,
+           '-flags:a', '+bitexact', dst]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+    except subprocess.CalledProcessError as e:
+        err = (e.stderr or b'').decode(errors='replace')[:200]
+        log(f"  warning: audio re-encode failed: {err}", verbose)
+        log("  keeping original audio unchanged", verbose)
+        return []
+
+    try:
+        frames = [f['data'] for f in _frames_from_file(dst, strip=strip)]
+    except (subprocess.CalledProcessError, KeyError, json.JSONDecodeError,
+            IndexError):
+        frames = []
+
+    if not frames:
+        log("  warning: audio re-encode produced no frames, keeping original audio",
+            verbose)
+        return []
+    return frames
+
+
+
+def psp_warnings(meta: dict, packets: list) -> list:
+    """Validate the container against the reference muxer / PSP player rules."""
+    w = []
+    vfmt, wdt, hgt = meta['vid_format'], meta['width'], meta['height']
+    vscale, vrate = meta['vid_scale'], meta['vid_rate']
+    afmt, nas = meta['aud_format'], meta['n_astreams']
+    amax, ascale = meta['aud_max_frames'], meta['aud_scale']
+    arate, stereo = meta['aud_rate'], meta['aud_stereo']
+
+    if vfmt not in (0, 1):
+        w.append(f"vid_format {vfmt} is not 0 (MPEG-4) or 1 (H.264)")
+    if wdt % 16 or hgt % 16:
+        w.append(f"resolution {wdt}x{hgt} must be a multiple of 16")
+    if vfmt == 1 and (wdt > 480 or hgt > 272):
+        w.append(f"resolution {wdt}x{hgt} exceeds the PSP AVC limit 480x272")
+    if vscale == 0 or vrate == 0:
+        w.append("vid_scale/vid_rate must not be 0")
+    elif vrate < vscale:
+        w.append("vid_rate < vid_scale")
+    if vscale > 0xffffff:
+        w.append("vid_scale > 0xffffff")
+
+    fps = (vrate / vscale) if vscale else 0
+    # All known-good XviD4PSP reference encodes are 29.97fps and play fine on
+    # the real ME -- only flag rates above that ceiling (spec allows up to ~38).
+    if fps > 29.98:
+        w.append(f"fps {fps:.2f} > 29.97 (reference encodes are 29.97fps max; "
+                 f"the PSP Media Engine cannot sustain anything above it)")
+
+    if nas:
+        if amax == 0:
+            w.append("aud_max_frames is 0 (players reject the file)")
+        if afmt not in (0, 1):
+            w.append(f"aud_format {afmt} is not 0 (MP3) or 1 (AAC)")
+        if afmt == 1 and ascale != 1024:
+            w.append(f"AAC aud_scale {ascale} != 1024 (decoder buffer math breaks)")
+        if afmt == 0 and ascale != 1152:
+            w.append(f"MP3 aud_scale {ascale} != 1152 (decoder buffer math breaks)")
+        if arate != 44100:
+            w.append(f"aud_rate {arate} != 44100 (reference player only accepts 44100)")
+        if stereo != 1:
+            w.append("aud_stereo != 1 (reference player only accepts stereo)")
+        if fps and (arate / ascale) <= fps:
+            w.append(f"fps {fps:.2f} >= audio frame rate {arate/ascale:.2f}: "
+                     "some video frames would carry no audio frame")
+    else:
+        w.append("no audio stream (reference players require at least one)")
+
+    dur = _time_of(1, vscale, vrate) if vscale else 0
+    max_naf = max((p['n_af'] for p in packets), default=0)
+    if max_naf > 255:
+        w.append(f"{max_naf} audio frames in one packet > 255 (does not fit the uint8)")
+    if nas and amax and max_naf > amax:
+        w.append(f"packet carries {max_naf} audio frames but header says {amax} "
+                 "-> heap overflow in the player")
+    if nas and any(p['n_af'] == 0 for p in packets):
+        w.append("some video frames carry no audio frame "
+                 "(the official muxer refuses such files)")
+
+    bad_delay = [i for i, p in enumerate(packets)
+                 if p['fd'] > dur or p['ld'] > dur]
+    if bad_delay:
+        w.append(f"first_delay/last_delay exceed the frame duration in "
+                 f"{len(bad_delay)} packets (A/V desync, up to a stall on PSP)")
+
+    no_aud = 0
+    bad_kf = 0
+    for p in packets:
+        nals = nal_units(p['vdata'])
+        if nals and nals[0][0] != 9:
+            no_aud += 1
+        if any(t == 5 for t, *_ in nals) and not keyframe_flag(p['vdata']):
+            bad_kf += 1
+    if no_aud:
+        w.append(f"{no_aud} packets do not start with an AUD NAL "
+                 "(sceMpegAvcDecode expects one access unit per packet)")
+    if bad_kf:
+        w.append(f"{bad_kf} IDR packets cannot be used as a seek point "
+                 "(an SEI sits between the AUD and the SPS, or the SPS is "
+                 "missing) - the reference muxer only flags "
+                 "AUD(primary_pic_type=0) + SPS as keyframe")
+
+    big = [i for i, p in enumerate(packets) if len(p['vdata']) > MAX_AU_SIZE]
+    if big:
+        w.append(f"{len(big)} video packets larger than {MAX_AU_SIZE} bytes - "
+                 "the reference player DMAs the AU into the fixed ME buffer "
+                 "at 0x4a000, oversized AUs corrupt memory on real hardware")
+
+    return w
 
 # --- subcommands -------------------------------------------------------------
 
@@ -674,59 +1038,148 @@ def _stream_flags(args) -> tuple:
 
 
 def do_compress(src: str, dst: str, args, verbose: bool):
-    """PMP -> PMP: re-encode video and/or audio.
+    """PMP -> PMP, directly on the container: no intermediate MP4, no decode.
 
-    Uses the chain: decode PMP -> MP4 (lossless-ish, preserves WxH/fps),
-    optionally squeeze the MP4, then convert back to PMP with the same
-    resolution/fps so the container structure is preserved exactly.
+    * video packets are pulled out of the file as raw Annex B and handed to the
+      encoder as an elementary stream (--stream video/both), otherwise they are
+      copied byte for byte;
+    * audio frames stay byte identical unless they are re-encoded in the codec
+      the header declares (--stream audio/both);
+    * the header (resolution, timing, audio format) is inherited from the
+      source file instead of being recomputed;
+    * audio/video interleaving uses the official pmp_muxer_avc algorithm, so
+      first_delay + audio + last_delay == frame duration for every packet.
     """
     args.preset = resolve_preset(args.preset)
     log(f"compress: {src} -> {dst}", verbose)
 
-    meta = parse_pmp(open(src, 'rb').read())
-    fps  = meta['fps']
-    w, h = meta['width'], meta['height']
+    raw   = open(src, 'rb').read()
+    meta  = parse_pmp(raw)
     do_vid, do_aud = _stream_flags(args)
 
-    mode_v = getattr(args, 'video_mode', 'vbr')
-    mode_a = getattr(args, 'audio_mode', 'cbr')
-    vbr_v  = getattr(args, 'video_bitrate', None)
-    aq     = getattr(args, 'audio_quality', 2.0)
-    ac, aud_stereo = _audio_channels(args)
+    if not meta['packets']:
+        die("input PMP has no packets")
 
-    stream = 'video' if do_vid and not do_aud else 'audio' if do_aud and not do_vid else 'both'
-    log(f"  {w}x{h} @ {fps:.2f}fps  {meta['n_vframes']} frames  [stream={stream}]", verbose)
+    covered = (HDR_SIZE + meta['n_vframes'] * 4
+               + sum(p['size'] for p in meta['packets']))
+    if covered != len(raw):
+        die(f"corrupt PMP: index covers {covered} bytes but the file is {len(raw)}")
+    if not meta['vid_rate'] or not meta['vid_scale']:
+        die("invalid PMP header: video scale/rate must not be 0")
+    if meta['n_astreams'] and not meta['aud_rate']:
+        die("invalid PMP header: aud_rate must not be 0")
+
+    width  = args.width  if args.width  is not None else meta['width']
+    height = args.height if args.height is not None else meta['height']
+    width  -= width  % 16
+    height -= height % 16
+    if width <= 0 or height <= 0:
+        die("--width/--height must be positive")
+    if not do_vid and (width != meta['width'] or height != meta['height']):
+        die("--width/--height needs the video re-encoded (--stream video/both)")
+
+    fps     = meta['fps']
+    v_rate  = meta['vid_rate']
+    v_scale = meta['vid_scale']
+    n_src   = meta['n_vframes']
+    stream  = ('video' if do_vid and not do_aud else
+               'audio' if do_aud and not do_vid else 'both')
+    log(f"  {width}x{height} @ {fps:.2f}fps  {n_src} frames  "
+        f"[stream={stream}]", verbose)
 
     src_mb = os.path.getsize(src) / 1048576
     tmp = tempfile.mkdtemp(prefix='pmpcli_')
     try:
-        # Step 1: decode PMP -> MP4 (h264 + aac, preserves WxH/fps).
-        mp4 = os.path.join(tmp, 'step.mp4')
-        decode_cmd = [
-            'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-            '-i', src, '-c:v', 'libx264',
-            '-preset', 'faster', '-crf', '16', '-pix_fmt', 'yuv420p',
-            '-c:a', 'aac', '-b:a', '192k',
-            '-movflags', '+faststart', mp4,
-        ]
-        subprocess.run(decode_cmd, check=True)
+        # --- video: raw Annex B straight out of the container --------------
+        if do_vid:
+            es = os.path.join(tmp, 'in.h264')
+            with open(es, 'wb') as f:
+                f.write(b''.join(p['vdata'] for p in meta['packets']))
+            new_v = encode_video(
+                es, width, height, fps, args, tmp, verbose,
+                video_mode=getattr(args, 'video_mode', 'vbr'),
+                video_bitrate=getattr(args, 'video_bitrate', None),
+                annexb=True, rate=v_rate, scale=v_scale)
+            if len(new_v) != n_src:
+                log(f"  warning: video frame count changed {n_src} -> {len(new_v)}",
+                    verbose)
+            log(f"  video: {len(new_v)} frames re-encoded  "
+                f"[{getattr(args, 'video_mode', 'vbr')}]", verbose)
+        else:
+            new_v = [normalize_startcodes(p['vdata'])
+                     for p in meta['packets']]
+            log(f"  video: {n_src} frames copied", verbose)
 
-        # Step 2: convert the decoded MP4 back to PMP. Resolution/fps are
-        # taken from the source (do_convert auto-picks them when width/height
-        # are None), so the structure is preserved.
+        # --- audio: raw frames stay raw unless re-encoded ------------------
+        src_nastreams = meta['n_astreams']
+        n_astreams = 0 if args.no_audio else src_nastreams
+        streams = []
+        if n_astreams:
+            for s in range(src_nastreams):
+                streams.append([a for p in meta['packets']
+                                for a in p['adata'][s::src_nastreams]])
+            if do_aud:
+                for i, st in enumerate(streams):
+                    new = reencode_audio_frames(st, meta, args, tmp, verbose,
+                                                tag=f'_{i}')
+                    if new:
+                        streams[i] = new
+            codec = 'AAC' if meta['aud_format'] == 1 else 'MP3'
+            log(f"  audio: {sum(len(s) for s in streams)} frames "
+                f"{'re-encoded' if do_aud else 'copied'}  [{codec}]", verbose)
 
-        # Save user override of the auto size so do_convert picks source dims.
-        saved_w, saved_h = args.width, args.height
-        args.width, args.height = None, None
+        # --- interleave exactly like the official muxer --------------------
+        n_v = len(new_v)
+        frame_dur = _time_of(1, v_scale, v_rate)
+        if n_astreams and streams and streams[0]:
+            plan = interleave_audio(n_v, v_rate, v_scale,
+                                    meta['aud_rate'], meta['aud_scale'])
+        else:
+            plan = [{'n_af': 0, 'fd': 0, 'ld': frame_dur, 'a_start': 0}
+                    for _ in range(n_v)]
 
-        try:
-            do_convert(mp4, dst, args, verbose)
-        finally:
-            args.width, args.height = saved_w, saved_h
+        new_pkts = []
+        for i, vd in enumerate(new_v):
+            p = plan[i]
+            adata = []
+            for st in streams:
+                for j in range(p['a_start'], p['a_start'] + p['n_af']):
+                    adata.append(st[j] if j < len(st) else b'')
+            new_pkts.append({
+                'kf':   1 if keyframe_flag(vd) else 0,
+                'n_af': p['n_af'],
+                'fd':   p['fd'],
+                'ld':   p['ld'],
+                'vdata': vd,
+                'adata': adata,
+            })
 
-        dst_mb = os.path.getsize(dst) / 1048576
-        log(f"  {src_mb:.2f} MB -> {dst_mb:.2f} MB  "
-            f"({100*(1-dst_mb/src_mb):.1f}% smaller)", verbose)
+        out_meta = dict(meta)
+        out_meta.update({
+            'n_vframes': n_v,
+            'width': width, 'height': height,
+            'n_astreams': n_astreams,
+            'aud_max_frames': max([p['n_af'] for p in new_pkts] + [1]),
+        })
+        if n_astreams == 0:
+            out_meta['aud_stereo'] = 0
+
+        for msg in psp_warnings(out_meta, new_pkts):
+            log(f"  warning: {msg}", verbose)
+
+        out = build_pmp(out_meta, new_pkts)
+        parent = os.path.dirname(os.path.abspath(dst))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(dst, 'wb') as f:
+            f.write(out)
+
+        dst_mb = len(out) / 1048576
+        smaller = ""
+        if src_mb:
+            delta = 100 * (1 - dst_mb / src_mb)
+            smaller = f"  ({delta:.1f}% {'smaller' if delta >= 0 else 'larger'})"
+        log(f"  {src_mb:.2f} MB -> {dst_mb:.2f} MB{smaller}", verbose)
     finally:
         if not args.keep_temp:
             shutil.rmtree(tmp, ignore_errors=True)
@@ -771,16 +1224,18 @@ def do_convert(src: str, dst: str, args, verbose: bool):
             src_fps = 0
         fps = min(FPS_MAX, src_fps) if src_fps else FPS_MAX
 
-    width  = args.width
-    height = args.height
+    src_w = int(vstream.get('width',  DEF_W)) or DEF_W
+    src_h = int(vstream.get('height', DEF_H)) or DEF_H
+    src_w -= src_w % 16          # PSP wants multiples of 16
+    src_h -= src_h % 16
 
-    # If width/height were not requested, preserve the source's dimensions.
-    if width is None or height is None:
-        width  = int(vstream.get('width',  DEF_W)) or DEF_W
-        height = int(vstream.get('height', DEF_H)) or DEF_H
-        # Force to a multiple of 16 for PSP compatibility.
-        width  -= width  % 16
-        height -= height % 16
+    # An omitted width/height keeps the source dimensions.
+    width  = src_w if args.width  is None else args.width
+    height = src_h if args.height is None else args.height
+    width  -= width  % 16
+    height -= height % 16
+    if width <= 0 or height <= 0:
+        die("--width/--height must be positive")
 
     vid_scale = 1000
     vid_rate  = round(fps * 1000)
@@ -803,24 +1258,37 @@ def do_convert(src: str, dst: str, args, verbose: bool):
         log(f"  video: {n_vframes} frames @ {fps:.3f}fps  "
             f"{width}x{height}  [{mode_v}]", verbose)
 
-        audio_buckets = [[] for _ in range(n_vframes)]
+        aframes = []
         if n_astreams > 0:
             aframes = extract_audio(src, tmp, aud_rate, ac,
                                     mode_a, args.audio_bitrate, aq, verbose)
-            audio_buckets = align_audio(n_vframes, fps, aframes)
-            log(f"  audio: {len(aframes)} AAC frames distributed  [{mode_a}]", verbose)
+            log(f"  audio: {len(aframes)} AAC frames  [{mode_a}]", verbose)
+
+        # Official pmp_muxer_avc interleaving: first_delay + audio + last_delay
+        # is exactly one video frame duration for every packet.
+        if n_astreams > 0 and aframes:
+            plan = interleave_audio(n_vframes, vid_rate, vid_scale,
+                                    aud_rate, aud_scale)
+        else:
+            frame_dur = _time_of(1, vid_scale, vid_rate)
+            plan = [{'n_af': 0, 'fd': 0, 'ld': frame_dur, 'a_start': 0}
+                    for _ in range(n_vframes)]
 
         new_pkts = []
         for i in range(n_vframes):
-            vd     = new_vframes[i]
-            bucket = audio_buckets[i]
-            kf     = 1 if is_keyframe(vd) else 0
-            n_af   = len(bucket)
-            fd, ld = delays_for(i, fps, bucket, aud_rate)
+            vd = new_vframes[i]
+            p  = plan[i]
+            adata = []
+            if n_astreams:
+                adata = [aframes[j]['data'] if j < len(aframes) else b''
+                         for j in range(p['a_start'], p['a_start'] + p['n_af'])]
             new_pkts.append({
-                'kf': kf, 'n_af': n_af,
-                'fd': fd, 'ld': ld,
-                'vdata': vd, 'adata': bucket
+                'kf':   1 if keyframe_flag(vd) else 0,
+                'n_af': p['n_af'],
+                'fd':   p['fd'],
+                'ld':   p['ld'],
+                'vdata': vd,
+                'adata': adata,
             })
 
         max_af = max((p['n_af'] for p in new_pkts), default=0)
@@ -831,11 +1299,14 @@ def do_convert(src: str, dst: str, args, verbose: bool):
             'width': width, 'height': height,
             'vid_scale': vid_scale, 'vid_rate': vid_rate,
             'aud_format': aud_format, 'n_astreams': n_astreams,
-            'aud_max_frames': max_af,
+            'aud_max_frames': max(max_af, 1),
             'aud_scale': aud_scale, 'aud_rate': aud_rate,
             'aud_stereo': aud_stereo,
             'fps': fps,
         }
+
+        for msg in psp_warnings(meta, new_pkts):
+            log(f"  warning: {msg}", verbose)
 
         out = build_pmp(meta, new_pkts)
         os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
@@ -1021,27 +1492,31 @@ def add_encode_args(p):
     g_vid.add_argument('--preset',     default='slow',
                        choices=PRESETS,
                        help='x264 preset (default: slow)')
-    g_vid.add_argument('--profile',    default='baseline',
+    g_vid.add_argument('--profile',    default='main',
                        choices=['baseline', 'main', 'high'],
-                       help='H.264 profile (default: baseline for PSP compatibility)')
+                       help='H.264 profile (default: main — matches XviD4PSP/ME-tested '
+                            'reference PMPs; baseline CAVLC hangs the real ME decoder)')
     g_vid.add_argument('--level',      default='3.0',
                        help='H.264 level, e.g. 1.3/2.1/3.0 (default: 1.3 for PSP)')
     g_vid.add_argument('--bframes',    type=int, default=0, choices=[0, 1, 2],
                        help='max B-frames (default: 0)')
     g_vid.add_argument('--deinterlace', action='store_true',
                        help='deinterlace source with yadif')
-    g_vid.add_argument('--width',      type=int, default=DEF_W,
-                       help=f'width (default: {DEF_W})')
-    g_vid.add_argument('--height',     type=int, default=DEF_H,
-                       help=f'height (default: {DEF_H})')
+    g_vid.add_argument('--width',      type=int, default=None,
+                       help=f'width (default: source, {DEF_W} for new encodes)')
+    g_vid.add_argument('--height',     type=int, default=None,
+                       help=f'height (default: source, {DEF_H} for new encodes)')
     g_vid.add_argument('--fps',        type=float, default=None,
-                       help=f'output fps (max {FPS_MAX}, >25 not recommended; default: 24 or source)')
-    g_vid.add_argument('--vbv-maxrate', type=int, default=768,
+                       help=f'output fps (max {FPS_MAX}; default: source fps)')
+    g_vid.add_argument('--vbv-maxrate', type=int, default=10000,
                        dest='vbv_maxrate',
-                       help='VBV maxrate kbps [vbr] (default: 768 for Level 1.3)')
-    g_vid.add_argument('--vbv-bufsize', type=int, default=2000,
+                       help='VBV maxrate kbps; with --nal-hrd vbr this drives the '
+                            'HRD VUI + per-frame pic_timing SEIs. Default 10000 '
+                            'matches XviD4PSP PMP output exactly (all reference '
+                            'PMPs decode to vbv 10000/10000)')
+    g_vid.add_argument('--vbv-bufsize', type=int, default=10000,
                        dest='vbv_bufsize',
-                       help='VBV bufsize kbps [vbr] (default: 2000 for Level 1.3)')
+                       help='VBV bufsize kbps; default 10000 matches XviD4PSP PMP output')
     g_vid.add_argument('--keyint',     type=int, default=250,
                        help='keyframe interval (default: 250)')
     g_vid.add_argument('--extra-x264', default='', dest='extra_x264',
