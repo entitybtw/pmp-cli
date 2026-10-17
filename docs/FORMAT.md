@@ -207,13 +207,28 @@ No effect on hardware.
 
 ## 4. Debugging on real hardware
 
+General PSP debugging guide (PSPLINK, psp-gdb, kprintf, stack traces):
+
+- **[PSPDEV — Debugging](https://pspdev.github.io/debugging.html)** — the
+  canonical guide: PSPLINK setup over USB, `psp-gdb`, `psp-addr2line` for
+  crash addresses, kernel printf
+- **[PSPDEV — Home](https://pspdev.github.io/)** — SDK install, how-to,
+  [PSPSDK docs](https://pspdev.github.io/pspsdk/)
+- **[psplinkusb releases](https://github.com/pspdev/psplinkusb/releases)** —
+  prebuilt `psplink.zip` (PRX modules + host-side tools); the upstream
+  docs at [pspdev.github.io/psplink](https://pspdev.github.io/psplink/) walk
+  through `usbhostfs` / `pspsh` on Linux
+
+Tools used for the hang captures in this repo:
+
 - **`pmpwatch.prx`** (this repo, `pmpwatch/`) — kernel plugin that dumps
   all thread states to `ms0:/pmp_watch.log` (or `ef0:` on PSP Go) every
   250 ms. Healthy decode: `decode`/`output` threads cycle wait states.
   Freeze signature: all player threads SLEEP (`wt=0x1`) forever inside
   firmware calls.
 - **psplink** — attach over USB (`start-host.sh` + `attach.sh`) for an
-  interactive shell and kprintf.
+  interactive shell and kprintf; used together with pmpwatch to catch the
+  ME hang stack.
 - The Lua test harness used for hardware verification lives in
   `pmp_test/` (`script.lua` plays a PMP through the openTri player inside
   LuaPlayerYT).
